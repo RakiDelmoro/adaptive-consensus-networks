@@ -1,0 +1,639 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ACN v3 — Animated Architecture Flowchart</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,"SF Mono","Segoe UI",sans-serif;background:#0a0a12;color:#d4d4d8;overflow-x:hidden}
+.header{padding:14px 24px;border-bottom:1px solid #27272a;background:#111118;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px;position:sticky;top:0;z-index:100}
+.title{font-size:1.1rem;font-weight:700;color:#22d3ee}
+.subtitle{font-size:0.7rem;color:#71717a;margin-top:2px}
+.controls{display:flex;gap:7px;align-items:center;flex-wrap:wrap}
+.controls button{background:#27272a;color:#e4e4e7;border:1px solid #3f3f46;padding:7px 14px;border-radius:6px;font-weight:600;cursor:pointer;font-size:0.8rem}
+.controls button:hover{background:#3f3f46}
+.controls button.play{background:linear-gradient(90deg,#0891b2,#7c3aed);border:none;color:#fff}
+.speed-control{display:flex;align-items:center;gap:5px;font-size:0.72rem;color:#71717a}
+.speed-control input{width:55px;accent-color:#22d3ee}
+.layout{display:flex;min-height:calc(100vh - 56px)}
+.sidebar{width:270px;flex-shrink:0;background:#111118;border-right:1px solid #27272a;padding:14px;overflow-y:auto;position:sticky;top:56px;height:calc(100vh - 56px)}
+.sidebar h3{font-size:0.72rem;color:#22d3ee;text-transform:uppercase;letter-spacing:1px;margin-bottom:8px}
+.step-nav{display:flex;flex-direction:column;gap:2px}
+.nav-item{padding:7px 9px;border-radius:5px;font-size:0.72rem;cursor:pointer;border:1px solid transparent;display:flex;align-items:center;gap:7px;transition:all .15s}
+.nav-item:hover{background:#1a1a24}
+.nav-item.active{background:rgba(34,211,238,.1);border-color:rgba(34,211,238,.3)}
+.nav-item .nav-num{width:18px;height:18px;border-radius:4px;background:#27272a;color:#a1a1aa;display:flex;align-items:center;justify-content:center;font-size:0.6rem;font-weight:700;flex-shrink:0}
+.nav-item.active .nav-num{background:#22d3ee;color:#0a0a12}
+.nav-item .nt{font-weight:600;color:#d4d4d8;font-size:0.7rem}
+.nav-item .nd{font-size:0.62rem;color:#71717a}
+.detail-panel{margin-top:10px;padding:10px;background:#0d0d14;border:1px solid #27272a;border-radius:7px;font-size:0.72rem;line-height:1.5;color:#a1a1aa}
+.detail-panel .dp-title{font-size:0.76rem;font-weight:700;color:var(--accent);margin-bottom:5px}
+.flowchart{flex:1;padding:24px 30px;overflow-y:auto;height:calc(100vh - 56px)}
+.flow-container{max-width:700px;margin:0 auto;display:flex;flex-direction:column;align-items:center;gap:0}
+.card{width:100%;max-width:660px;border:1px solid #27272a;border-radius:11px;transition:all .35s;opacity:0.32;background:#131318;overflow:hidden}
+.card.active{opacity:1;border-color:var(--accent);box-shadow:0 0 28px var(--glow)}
+.card-header{padding:9px 14px;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid #1e1e24;background:var(--header-bg)}
+.card-step{font-size:0.62rem;font-weight:700;color:var(--accent);text-transform:uppercase;letter-spacing:1px}
+.card-title{font-size:0.84rem;font-weight:700;color:#e4e4e7}
+.card-badge{font-size:0.58rem;padding:2px 7px;border-radius:9px;background:var(--badge-bg);color:var(--accent);font-weight:600}
+.card-body{padding:12px 14px;display:flex;flex-direction:column;gap:8px}
+.shape-row{display:flex;align-items:center;gap:7px;font-size:0.68rem;font-family:"SF Mono",monospace;flex-wrap:wrap}
+.shape{padding:2px 7px;border-radius:4px;background:#1a1a24;border:1px solid #27272a;color:#a1a1aa;font-size:0.64rem}
+.shape.in{color:#fb923c;border-color:rgba(251,146,60,.3)}
+.shape.out{color:#4ade80;border-color:rgba(74,222,128,.3)}
+.arrow-sm{color:#52525b}
+.eq{font-family:"SF Mono",monospace;font-size:0.68rem;color:#fbbf24;background:#1a1a24;padding:7px 9px;border-radius:5px;border:1px solid #27272a;line-height:1.55;overflow-x:auto}
+.desc{font-size:0.71rem;color:#a1a1aa;line-height:1.45}
+.desc .hl{color:var(--accent);font-weight:600}
+/* ── Animation panel ── */
+.anim{width:100%;height:90px;background:#0a0a12;border:1px solid #1e1e24;border-radius:7px;position:relative;overflow:hidden;margin-top:2px}
+.anim.tall{height:200px}
+.anim svg{width:100%;height:100%}
+.flow-arrow{width:2px;height:24px;background:#27272a;margin:0 auto;position:relative;transition:background .3s}
+.flow-arrow.active{background:var(--accent)}
+.flow-arrow::after{content:'';position:absolute;bottom:-1px;left:50%;transform:translateX(-50%);width:0;height:0;border-left:5px solid transparent;border-right:5px solid transparent;border-top:6px solid #27272a;transition:border-top-color .3s}
+.flow-arrow.active::after{border-top-color:var(--accent)}
+.loop-box{width:100%;max-width:660px;border:2px dashed #3f3f46;border-radius:11px;padding:12px;position:relative;background:rgba(34,211,238,.02)}
+.loop-label{position:absolute;top:-9px;left:18px;background:#131318;padding:0 8px;font-size:0.66rem;font-weight:700;color:#22d3ee}
+.substeps{display:flex;flex-direction:column;gap:4px;margin-top:3px;padding-left:10px;border-left:2px solid #27272a}
+.substep{display:flex;align-items:flex-start;gap:7px;font-size:0.68rem;color:#a1a1aa;opacity:0.4;transition:opacity .3s}
+.substep.active{opacity:1;color:#e4e4e7}
+.substep .ss-num{width:16px;height:16px;border-radius:3px;background:#1a1a24;color:#71717a;display:flex;align-items:center;justify-content:center;font-size:0.56rem;font-weight:700;flex-shrink:0;margin-top:1px}
+.substep.active .ss-num{background:var(--accent);color:#0a0a12}
+.substep .ss-label{font-weight:600;color:#e4e4e7;font-size:0.68rem}
+.substep .ss-eq{font-family:"SF Mono",monospace;color:#fbbf24;font-size:0.64rem}
+.substep .ss-desc{color:#71717a;font-size:0.64rem;margin-top:2px}
+/* ── animation primitives ── */
+@keyframes flowRight{0%{transform:translateX(0);opacity:0}10%{opacity:1}90%{opacity:1}100%{transform:translateX(var(--dist,200px));opacity:0}}
+@keyframes pulseDot{0%,100%{opacity:0.3;transform:scale(0.8)}50%{opacity:1;transform:scale(1.2)}}
+@keyframes fillBar{from{width:0}to{width:var(--w,80%)}}
+@keyframes sweep{0%{transform:translateX(-30px)}100%{transform:translateX(620px)}}
+@keyframes fadeUp{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
+.flow-dot{position:absolute;width:6px;height:6px;border-radius:50%;animation:flowRight 1.5s linear infinite}
+.theme-input{--accent:#60a5fa;--glow:rgba(96,165,250,.2);--header-bg:rgba(96,165,250,.08);--badge-bg:rgba(96,165,250,.1)}
+.theme-decompose{--accent:#fb923c;--glow:rgba(251,146,60,.2);--header-bg:rgba(251,146,60,.08);--badge-bg:rgba(251,146,60,.1)}
+.theme-encoder{--accent:#a78bfa;--glow:rgba(167,139,250,.2);--header-bg:rgba(167,139,250,.08);--badge-bg:rgba(167,139,250,.1)}
+.theme-gate{--accent:#4ade80;--glow:rgba(74,222,128,.2);--header-bg:rgba(74,222,128,.08);--badge-bg:rgba(74,222,128,.1)}
+.theme-primer{--accent:#f472b6;--glow:rgba(244,114,182,.2);--header-bg:rgba(244,114,182,.08);--badge-bg:rgba(244,114,182,.1)}
+.theme-consensus{--accent:#22d3ee;--glow:rgba(34,211,238,.25);--header-bg:rgba(34,211,238,.08);--badge-bg:rgba(34,211,238,.1)}
+.theme-decode{--accent:#818cf8;--glow:rgba(129,140,248,.2);--header-bg:rgba(129,140,248,.08);--badge-bg:rgba(129,140,248,.1)}
+.theme-abstract{--accent:#fbbf24;--glow:rgba(251,191,36,.2);--header-bg:rgba(251,191,36,.08);--badge-bg:rgba(251,191,36,.1)}
+.theme-fusion{--accent:#f43f5e;--glow:rgba(244,63,94,.2);--header-bg:rgba(244,63,94,.08);--badge-bg:rgba(244,63,94,.1)}
+.theme-output{--accent:#34d399;--glow:rgba(52,211,153,.2);--header-bg:rgba(52,211,153,.08);--badge-bg:rgba(52,211,153,.1)}
+.progress-bar-wrap{position:fixed;bottom:0;left:0;right:0;height:3px;background:#111118;z-index:100}
+.progress-bar-fill{height:100%;width:0%;background:linear-gradient(90deg,#22d3ee,#a78bfa);transition:width .3s}
+</style>
+</head>
+<body>
+<div class="header">
+  <div><div class="title">ACN v3 — Animated Architecture Flowchart</div>
+  <div class="subtitle">Every layer · every shape · every equation — animated</div></div>
+  <div class="controls">
+    <div class="speed-control"><label>Speed</label><input type="range" id="speed" min="0.5" max="3" step="0.25" value="1.2"><span id="speedLabel">1.2x</span></div>
+    <button id="btnReset">↺</button><button id="btnPrev">←</button>
+    <button id="btnPlay" class="play">▶ Play</button><button id="btnNext">→</button>
+  </div>
+</div>
+<div class="layout">
+  <aside class="sidebar"><h3>Steps</h3><div class="step-nav" id="stepNav"></div>
+    <div class="detail-panel theme-consensus" id="detailPanel"><div class="dp-title">Click Play</div>Walks through every operation in forward().</div>
+  </aside>
+  <div class="flowchart"><div class="flow-container" id="flowContainer"></div></div>
+</div>
+<div class="progress-bar-wrap"><div class="progress-bar-fill" id="progFill"></div></div>
+<script>
+// ════════════════════════════════════════════════════════════════
+// ACN v3 — Animated Layer-by-Layer Flowchart
+// ════════════════════════════════════════════════════════════════
+const steps=[
+{id:'input',theme:'theme-input',step:'Step 0',badge:'INPUT',title:'Image Batch',
+ shapes:{in:'—',out:'(B, 1, 28, 28)'},
+ eq:'images → MNIST grayscale batch',
+ desc:'A batch of <span class="hl">B=128</span> grayscale 28×28 digits. Values in [0,1].',
+ nav:{t:'Image Input',d:'(B,1,28,28)'},
+ detail:'<span class="dp-title">Step 0: Image Batch</span>B=128 samples. Raw [0,1] tensors — v3 trains without mean/std normalization.',
+ anim:'input'},
+{id:'decompose',theme:'theme-decompose',step:'Step 1',badge:'DECOMPOSE',title:'Multi-Scale Decomposition',
+ shapes:{in:'(B,1,28,28)',out:'patches (B,74,16) + coords (74,2)'},
+ eq:'roster = 49×(4×4) + 16×(6×6) + 9×(8×8) = 74\npatches = adaptive_avg_pool2d → 4×4 = 16 dims',
+ desc:'Image sliced into <span class="hl">74 overlapping patches</span> of 3 sizes, pooled to 4×4. Each column keeps a permanent <span class="hl">(row,col)</span>.',
+ nav:{t:'Multi-Scale Decompose',d:'74 patches+coords'},
+ detail:'<span class="dp-title">Step 1: Decomposition</span>Three grids at strides 4,6,8. <span class="dp-hl">4×4</span> = fine detail, <span class="dp-hl">8×8</span> = coarse structure. Roster is <span class="dp-hl">fixed at init</span> — columns never move.',
+ anim:'decompose'},
+{id:'encoder',theme:'theme-encoder',step:'Step 2',badge:'ENCODER',title:'Encoder — What + Where Binding',
+ shapes:{in:'patches (B,74,16) + coords (74,2)',out:'A (B,74,32,32), b (B,74,32), s (B,74)'},
+ eq:'what  = MLP_what(patches)         → (B,74,32)\nwhere = project(pos_embed(coords)) → (B,74,32)\nb = b + where                     ← BINDING\nA = L·Lᵀ + 0.01·I                 ← SPD\ns = relevance logit               → (B,74)',
+ desc:'Each column binds <span class="hl">what</span> (pixels) with <span class="hl">where</span> (position). A=local quadratic, b=linear, s=relevance.',
+ nav:{t:'Encoder (What+Where)',d:'A,b,s per column'},
+ detail:'<span class="dp-title">Step 2: Reference-Frame Binding</span>The binding <span class="dp-hl">b = b + where</span> is the core TBT mechanism. A loop at top-left ≠ same loop at bottom-right. <span class="dp-hl">A=L·Lᵀ+εI</span> guarantees SPD for Cholesky.',
+ anim:'encoder'},
+{id:'gate',theme:'theme-gate',step:'Step 3',badge:'GATE',title:'Hard Top-k Gate (Gumbel-STE)',
+ shapes:{in:'s (B,74)',out:'active (B,74) ∈ {0,1}'},
+ eq:'gumbel = -log(-log(uniform))\nnoisy = (s + gumbel) / τ\nsoft = softmax(noisy)\nhard = one_hot(top_k(soft, k=8))\nactive = hard + (soft - soft.detach())\nb = b · active_mask',
+ desc:'Exactly <span class="hl">8 of 74</span> columns activated. Forward: binary. Backward: soft gradient.',
+ nav:{t:'Hard Top-k Gate',d:'8/74 active'},
+ detail:'<span class="dp-title">Step 3: Sparse Gate</span><span class="dp-hl">Gumbel-Softmax STE</span>: forward uses binary mask (exactly 8 ones), backward uses soft gradient. τ=0.5. After gating, b is masked so inactive columns propose nothing.',
+ anim:'gate'},
+{id:'primer',theme:'theme-primer',step:'Step 4',badge:'PRIMER',title:'Top-Down Primer (Warm Start)',
+ shapes:{in:'A, b, active',out:'z_init (B,74,32)'},
+ eq:'x_preview = (A+ρI)⁻¹·b       [z=0, u=0]\nz_preview = fuse(x_preview, active) → (B,32)\np = W_primer(z_preview)     → (B,32)\nz_init = broadcast(p)       → (B,74,32)',
+ desc:'A 1-shot preview primal gives a global guess, projected into <span class="hl">z_init</span>. Consensus starts warm, not from zero.',
+ nav:{t:'Top-Down Primer',d:'warm-start z'},
+ detail:'<span class="dp-title">Step 4: Primer</span>One <span class="dp-hl">Cholesky solve</span> with z=0,u=0 → preview proposals → sparse-fuse → W_primer → broadcast. This is L1 top-down priming from TBT.',
+ anim:'primer'},
+{id:'consensus',theme:'theme-consensus',step:'Step 5',badge:'CONSENSUS',title:'Bottom Consensus — 20 ADMM Rounds',
+ shapes:{in:'A, b, z_init, active',out:'z (B,74,32), u (B,74,32)'},
+ eq:'edges = all_pairs(74) → (2,2016)\nr_ij = softplus(RestrictionMaps) → (2016,32)\nD = D_init · edge_mask   [fixed conductance]',
+ desc:'Core ADMM loop: <span class="hl">primal → consensus → motor → dual</span>, repeated 20×. Detach after round 4.',
+ nav:{t:'Consensus Loop',d:'20 ADMM rounds'},
+ detail:'<span class="dp-title">Step 5: Consensus</span><span class="dp-hl">All-pairs</span>: 2016 edges. D is <span class="dp-hl">fixed</span> (no Physarum in v3). <span class="dp-hl">detach_after=4</span>: only first 4 rounds backprop end-to-end.',
+ anim:'consensus',loop:true,
+ substeps:[
+  {num:'a',label:'PRIMAL',eq:'x = (A+ρI)⁻¹(b·mask + ρ(z−u))  [Cholesky, chunk=2048]',desc:'Each active column solves its local quadratic.'},
+  {num:'b',label:'FLUX',eq:'Q = ‖r_ij·z_i − r_ji·z_j‖² → (B,2016)',desc:'Disagreement measured for inspection only.'},
+  {num:'c',label:'CONSENSUS',eq:'z += η(ρ(x+u−z) − D·disagreement); z *= mask',desc:'Pull toward evidence + smooth neighbors.'},
+  {num:'d',label:'MOTOR',eq:'motor=tanh(W·z); z += W_to_z(motor)  [path integration]',desc:'Column moves its latent position. Prevents collapse.'},
+  {num:'e',label:'DUAL+EFFERENCE',eq:'u += mask·(x−z + W_to_u(motor))  [efference copy]',desc:'Dual remembers compromise + motor movement.'},
+ ]},
+{id:'decode_b',theme:'theme-decode',step:'Step 6',badge:'DECODE',title:'Bottom Decode + Sparse Fuse',
+ shapes:{in:'z (B,74,32)',out:'pred_bottom (B,10)'},
+ eq:'logits = Decoder(z) → (B,74,10)\npred_bottom = Σ(active·logits) / Σ(active) → (B,10)',
+ desc:'8 active columns decode z → 10-class vote. Only active columns count.',
+ nav:{t:'Bottom Decode',d:'pred_bottom (B,10)'},
+ detail:'<span class="dp-title">Step 6: Bottom Vote</span><span class="dp-hl">sparse_fuse</span>: weighted average over active columns only. Inactive contribute nothing. This is the Thousand-Brains sparse vote.',
+ anim:'decode_b'},
+{id:'abs_enc',theme:'theme-abstract',step:'Step 7',badge:'ABSTRACT',title:'Abstract Encoder (Layer 2)',
+ shapes:{in:'z (B,74,32), active (B,74)',out:'A2 (B,8,16,16), b2 (B,8,16), s2 (B,8)'},
+ eq:'z_global = fuse(z, active) → (B,32)\nwhat2 = MLP(z_global) → (B,16)\nwhere2 = pos_embed(abstract_pos) → (8,16)\nh2 = what2 + where2 → (B,8,16)\nactive2 = top_k(s2, k=4)',
+ desc:'<span class="hl">8 abstract columns</span> read the <span class="hl">fused bottom consensus</span> (not pixels). Each has a learned concept-space position. Top-4 selected.',
+ nav:{t:'Abstract Encoder',d:'reads global z'},
+ detail:'<span class="dp-title">Step 7: Abstract Encoder</span>Does NOT see pixels — sees <span class="dp-hl">z_global</span>. This is "high-level columns receive L2/3 outputs of lower columns" (TBT). <span class="dp-hl">abstract_pos</span> is a learned (8,2) parameter.',
+ anim:'abs_enc'},
+{id:'abs_con',theme:'theme-abstract',step:'Step 8',badge:'ABSTRACT',title:'Abstract Consensus (5 Rounds, No Motor)',
+ shapes:{in:'A2, b2, active2',out:'z2 (B,8,16)'},
+ eq:'edges2 = all_pairs(8) → (2,28)\nfor k in 0..4:\n  x2 = (A2+ρI)⁻¹(b2·mask + ρ(z2−u2))\n  z2 += η(ρ(x2+u2−z2) − D2·disagreement)\n  u2 += mask·(x2 − z2)   [no motor]',
+ desc:'Same canonical ADMM, <span class="hl">no motor</span> (fixed global state). Only 5 rounds. No detach.',
+ nav:{t:'Abstract Consensus',d:'5 rounds, no motor'},
+ detail:'<span class="dp-title">Step 8: Abstract Consensus</span>Same <span class="dp-hl">ACNCore.run</span> but motor_system=None. Smaller: N=8, d=16, E=28. All 5 rounds backprop. Optional top-down primer from primer_topdown(z_global).',
+ anim:'abs_con'},
+{id:'abs_dec',theme:'theme-abstract',step:'Step 9',badge:'ABSTRACT',title:'Abstract Decode + Sparse Fuse',
+ shapes:{in:'z2 (B,8,16)',out:'pred_abstract (B,10)'},
+ eq:'logits_abs = AbstractDecoder(z2) → (B,8,10)\npred_abstract = Σ(active2·logits) / Σ(active2) → (B,10)',
+ desc:'4 active abstract columns vote. This is the <span class="hl">global gestalt</span> — resolves 0 vs 6 vs 9.',
+ nav:{t:'Abstract Decode',d:'pred_abstract (B,10)'},
+ detail:'<span class="dp-title">Step 9: Abstract Vote</span>Captures <span class="dp-hl">global structure</span>. A bottom column seeing a loop can\'t tell 0/6/9. The abstract column sees loop+tail and votes 9.',
+ anim:'abs_dec'},
+{id:'fusion',theme:'theme-fusion',step:'Step 10',badge:'FUSION',title:'Final Fusion',
+ shapes:{in:'pred_bottom + pred_abstract',out:'pred (B,10)'},
+ eq:'pred = pred_bottom + pred_abstract → (B,10)',
+ desc:'Sensory vote + conceptual vote <span class="hl">summed</span>. Both voices equal.',
+ nav:{t:'Final Fusion',d:'bottom + abstract'},
+ detail:'<span class="dp-title">Step 10: Fusion</span>Currently an <span class="dp-hl">unweighted sum</span>. A learned fusion weight could let the model decide when to trust each layer.',
+ anim:'fusion'},
+{id:'output',theme:'theme-output',step:'Step 11',badge:'OUTPUT',title:'Classification Output',
+ shapes:{in:'pred (B,10)',out:'class (B,)'},
+ eq:'class = argmax(pred) → (B,)\nloss = CE + 0.001·z_loss + 0.001·sparsity + 0.5·local_loss',
+ desc:'Highest score wins. Training adds <span class="hl">z-loss</span>, <span class="hl">sparsity</span>, <span class="hl">local loss</span>.',
+ nav:{t:'Output',d:'argmax → class'},
+ detail:'<span class="dp-title">Step 11: Output</span>Total loss = <span class="dp-hl">CE</span> + 0.001·<span class="dp-hl">z_loss</span> (both layers) + 0.001·<span class="dp-hl">sparsity</span> + 0.5·<span class="dp-hl">local_loss</span> (per-column CE × active mean).',
+ anim:'output'},
+];
+
+// ════════════════════════════════════════════════════════════════
+// State
+// ════════════════════════════════════════════════════════════════
+let currentIdx=0,isPlaying=false,playTimer=null,speed=1.2;
+let animTimers=[]; // active animation intervals
+
+// ════════════════════════════════════════════════════════════════
+// Build flowchart DOM
+// ════════════════════════════════════════════════════════════════
+function buildFlowchart(){
+ const c=document.getElementById('flowContainer');c.innerHTML='';
+ steps.forEach((s,i)=>{
+  if(i>0){const a=document.createElement('div');a.className='flow-arrow';a.id='arrow-'+i;c.appendChild(a);}
+  const card=document.createElement('div');card.className='card '+s.theme;card.id='card-'+i;
+  let ssHTML='';
+  if(s.substeps){
+   ssHTML='<div class="substeps">';
+   s.substeps.forEach(ss=>{ssHTML+=`<div class="substep" id="ss-${i}-${ss.num}"><div class="ss-num">${ss.num}</div><div><div class="ss-label">${ss.label}</div><div class="ss-eq">${ss.eq}</div><div class="ss-desc">${ss.desc}</div></div></div>`;});
+   ssHTML+='</div>';
+  }
+  const animClass = s.anim==='consensus'?'anim tall':'anim';
+  card.innerHTML=`
+   <div class="card-header"><div style="display:flex;align-items:center;gap:8px"><span class="card-step">${s.step}</span><span class="card-title">${s.title}</span></div><span class="card-badge">${s.badge}</span></div>
+   <div class="card-body">
+    <div class="shape-row"><span class="shape in">${s.shapes.in}</span><span class="arrow-sm">──▶</span><span class="shape out">${s.shapes.out}</span></div>
+    <div class="anim-wrap"><div class="${animClass}" id="anim-${s.anim}"></div></div>
+    <div class="eq">${s.eq.replace(/\n/g,'<br>')}</div>
+    <div class="desc">${s.desc}</div>
+    ${ssHTML}
+   </div>`;
+  if(s.loop){const w=document.createElement('div');w.className='loop-box';w.innerHTML='<div class="loop-label">↻ REPEAT × 20</div>';w.appendChild(card);c.appendChild(w);}
+  else c.appendChild(card);
+ });
+}
+
+// ════════════════════════════════════════════════════════════════
+// Build sidebar nav
+// ════════════════════════════════════════════════════════════════
+function buildNav(){
+ const n=document.getElementById('stepNav');n.innerHTML='';
+ steps.forEach((s,i)=>{const e=document.createElement('div');e.className='nav-item';e.id='nav-'+i;
+  e.innerHTML=`<div class="nav-num">${i}</div><div><div class="nt">${s.nav.t}</div><div class="nd">${s.nav.d}</div></div>`;
+  e.addEventListener('click',()=>jumpTo(i));n.appendChild(e);});
+}
+
+// ════════════════════════════════════════════════════════════════
+// Stop all animations
+// ════════════════════════════════════════════════════════════════
+function stopAllAnims(){
+ animTimers.forEach(t=>clearInterval(t));animTimers=[];
+ document.querySelectorAll('.anim').forEach(a=>{a.innerHTML='';});
+}
+
+// ════════════════════════════════════════════════════════════════
+// Per-step animations (SVG + JS driven)
+// ════════════════════════════════════════════════════════════════
+function startAnim(name){
+ const el=document.getElementById('anim-'+name);if(!el)return;
+ // helper to make an SVG element
+ function svg(w,h,inner){return `<svg viewBox="0 0 ${w} ${h}" preserveAspectRatio="xMidYMid meet">${inner}</svg>`;}
+
+ if(name==='input'){
+  // 28x28 pixel grid, stroke dots pulse
+  let html='<svg viewBox="0 0 620 90" width="100%" height="100%">';
+  const S=new Set();const add=(r,c)=>{if(r>=0&&r<28&&c>=0&&c<28)S.add(r*28+c)};
+  // mini 9
+  for(let c=8;c<=19;c++){add(4,c);add(5,c)}add(6,7);add(7,6);add(6,19);add(7,19);
+  for(let c=8;c<=18;c++)add(7,c);add(8,18);add(9,17);add(10,17);
+  for(let r=6;r<=10;r++)add(r,19);
+  for(let r=11;r<=20;r++)add(r,15);add(21,14);
+  const cell=2.4,ox=80,oy=12;
+  for(let r=0;r<28;r++)for(let c=0;c<28;c++){
+   const x=ox+c*cell,y=oy+r*cell,on=S.has(r*28+c);
+   html+=`<rect x="${x}" y="${y}" width="${cell}" height="${cell}" fill="${on?'#60a5fa':'#0d0d1a'}" rx="0.5">
+     <animate attributeName="opacity" values="${on?'1;0.5;1':'0.3;0.3'}" dur="${on?1.5:3}s" repeatCount="indefinite"/></rect>`;
+  }
+  html+=`<text x="20" y="50" fill="#60a5fa" font-size="11" font-family="monospace">28×28</text>`;
+  html+=`<text x="20" y="66" fill="#71717a" font-size="8">B=128</text>`;
+  // flowing pulse to right
+  html+=`<circle cx="0" cy="45" r="3" fill="#60a5fa"><animate attributeName="cx" from="${ox+70}" to="600" dur="1.5s" repeatCount="indefinite"/><animate attributeName="opacity" values="0;1;1;0" dur="1.5s" repeatCount="indefinite"/></circle>`;
+  html+='</svg>';el.innerHTML=html;
+ }
+ else if(name==='decompose'){
+  // three colored squares sweeping across a mini grid
+  let html='<svg viewBox="0 0 620 90" width="100%" height="100%">';
+  // mini image grid
+  const gx=20,gy=15,gw=60,gh=60,cells=8,cs=gw/cells;
+  html+=`<rect x="${gx}" y="${gy}" width="${gw}" height="${gh}" fill="none" stroke="#27272a"/>`;
+  for(let i=1;i<cells;i++){html+=`<line x1="${gx+i*cs}" y1="${gy}" x2="${gx+i*cs}" y2="${gy+gh}" stroke="#1a1a24"/>`;
+   html+=`<line x1="${gx}" y1="${gy+i*cs}" x2="${gx+gw}" y2="${gy+i*cs}" stroke="#1a1a24"/>`;}
+  // stroke dots
+  for(let r=1;r<cells;r++)for(let c=1;c<cells;c++){if((r+c)%3===0)html+=`<rect x="${gx+c*cs+1}" y="${gy+r*cs+1}" width="${cs-2}" height="${cs-2}" fill="#fb923c" opacity="0.4"/>`;}
+  // three patch windows of different sizes sweeping
+  const sizes=[{s:2,col:'#3fb950',label:'4×4'},{s:3,col:'#58a6ff',label:'6×6'},{s:4,col:'#d29922',label:'8×8'}];
+  sizes.forEach((sz,i)=>{
+   const ps=sz.s*cs;
+   html+=`<rect x="${gx}" y="${gy}" width="${ps}" height="${ps}" fill="none" stroke="${sz.col}" stroke-width="2" opacity="0.8">
+     <animate attributeName="x" values="${gx};${gx+gw-ps};${gx}" dur="${2+i*0.5}s" repeatCount="indefinite"/>
+     <animate attributeName="y" values="${gy};${gy+gh-ps};${gy}" dur="${2.5+i*0.3}s" repeatCount="indefinite"/></rect>`;
+   html+=`<text x="${gx+ps+4}" y="${gy+12+i*14}" fill="${sz.col}" font-size="9" font-family="monospace">${sz.label}</text>`;
+  });
+  // output: 74 boxes mini grid on right
+  const bx=300,by=15,bw=8;
+  for(let i=0;i<74;i++){const r=Math.floor(i/10),c=i%10;
+   html+=`<rect x="${bx+c*(bw+2)}" y="${by+r*(bw+2)}" width="${bw}" height="${bw}" fill="#1a1a24" stroke="#27272a" stroke-width="0.5">
+     <animate attributeName="fill" values="#1a1a24;${i<49?'#3fb950':i<65?'#58a6ff':'#d29922'};#1a1a24" dur="2s" begin="${i*0.02}s" repeatCount="indefinite"/></rect>`;}
+  html+=`<text x="${bx}" y="${by+85}" fill="#fb923c" font-size="9">74 columns</text>`;
+  // arrow
+  html+=`<line x1="120" y1="45" x2="290" y2="45" stroke="#fb923c" stroke-width="1.5" marker-end="url(#arr)"/>`;
+  html+=`<defs><marker id="arr" markerWidth="6" markerHeight="6" refX="5" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6" fill="#fb923c"/></marker></defs>`;
+  html+='</svg>';el.innerHTML=html;
+ }
+ else if(name==='encoder'){
+  // what (orange) + where (purple) streams merging into b
+  let html='<svg viewBox="0 0 620 90" width="100%" height="100%">';
+  // what stream
+  html+=`<rect x="20" y="20" width="80" height="20" rx="4" fill="rgba(251,146,60,0.2)" stroke="#fb923c"/>`;
+  html+=`<text x="30" y="34" fill="#fb923c" font-size="10">what (pixels)</text>`;
+  // where stream
+  html+=`<rect x="20" y="50" width="80" height="20" rx="4" fill="rgba(167,139,250,0.2)" stroke="#a78bfa"/>`;
+  html+=`<text x="30" y="64" fill="#a78bfa" font-size="10">where (pos)</text>`;
+  // flowing dots
+  for(let i=0;i<3;i++){
+   html+=`<circle cx="100" cy="30" r="3" fill="#fb923c"><animate attributeName="cx" from="100" to="280" dur="1.2s" begin="${i*0.4}s" repeatCount="indefinite"/><animate attributeName="opacity" values="0;1;0" dur="1.2s" begin="${i*0.4}s" repeatCount="indefinite"/></circle>`;
+   html+=`<circle cx="100" cy="60" r="3" fill="#a78bfa"><animate attributeName="cx" from="100" to="280" dur="1.2s" begin="${i*0.4}s" repeatCount="indefinite"/><animate attributeName="opacity" values="0;1;0" dur="1.2s" begin="${i*0.4}s" repeatCount="indefinite"/></circle>`;
+  }
+  // merge node
+  html+=`<circle cx="290" cy="45" r="14" fill="rgba(167,139,250,0.2)" stroke="#a78bfa" stroke-width="2"/>`;
+  html+=`<text x="284" y="49" fill="#a78bfa" font-size="14" font-weight="bold">+</text>`;
+  // output: A, b, s boxes
+  html+=`<rect x="340" y="15" width="80" height="18" rx="3" fill="rgba(34,211,238,0.1)" stroke="#22d3ee"/><text x="350" y="28" fill="#22d3ee" font-size="9">A (32×32)</text>`;
+  html+=`<rect x="340" y="38" width="80" height="18" rx="3" fill="rgba(34,211,238,0.1)" stroke="#22d3ee"/><text x="350" y="51" fill="#22d3ee" font-size="9">b (32)</text>`;
+  html+=`<rect x="340" y="61" width="80" height="18" rx="3" fill="rgba(34,211,238,0.1)" stroke="#22d3ee"/><text x="350" y="74" fill="#22d3ee" font-size="9">s (relevance)</text>`;
+  // flowing dots from merge to outputs
+  for(let i=0;i<3;i++){
+   html+=`<circle cx="304" cy="45" r="2.5" fill="#a78bfa"><animate attributeName="cx" from="304" to="340" dur="0.8s" begin="${i*0.3}s" repeatCount="indefinite"/><animate attributeName="cy" values="${24+i*19};${24+i*19}" dur="0.8s" repeatCount="indefinite"/><animate attributeName="opacity" values="0;1;0" dur="0.8s" begin="${i*0.3}s" repeatCount="indefinite"/></circle>`;
+  }
+  // 74 columns mini on right
+  for(let i=0;i<24;i++){html+=`<rect x="${440+i*7}" y="30" width="5" height="30" fill="#a78bfa" opacity="${0.2+0.6*Math.random()}"><animate attributeName="opacity" values="0.2;0.8;0.2" dur="${1+i*0.1}s" repeatCount="indefinite"/></rect>`;}
+  html+=`<text x="440" y="80" fill="#71717a" font-size="8">× 74 columns</text>`;
+  html+='</svg>';el.innerHTML=html;
+ }
+ else if(name==='gate'){
+  // 74 dots, 8 light up green one by one, rest fade red
+  let html='<svg viewBox="0 0 620 90" width="100%" height="100%">';
+  const winners=new Set([3,11,22,31,40,51,60,68]);
+  for(let i=0;i<74;i++){
+   const r=Math.floor(i/15),c=i%15;
+   const x=20+c*36, y=15+r*30;
+   const isWin=winners.has(i);
+   if(isWin){
+    html+=`<circle cx="${x}" cy="${y}" r="9" fill="#4ade80" stroke="#22c55e" stroke-width="2">
+      <animate attributeName="r" values="9;12;9" dur="1.5s" repeatCount="indefinite"/>
+      <animate attributeName="opacity" values="0;0;1" dur="1.2s" begin="${[...winners].indexOf(i)*0.15}s" fill="freeze"/></circle>`;
+    html+=`<text x="${x-3}" y="${y+3}" fill="#0a0a12" font-size="8" font-weight="bold">✓</text>`;
+   } else {
+    html+=`<circle cx="${x}" cy="${y}" r="7" fill="#27272a" stroke="#3f3f46">
+      <animate attributeName="opacity" values="0.6;0.2" dur="1s" begin="1s" fill="freeze"/></circle>`;
+   }
+  }
+  html+=`<text x="20" y="85" fill="#4ade80" font-size="10" font-weight="bold">k=8 winners (green) · 66 silenced (grey)</text>`;
+  html+='</svg>';el.innerHTML=html;
+ }
+ else if(name==='primer'){
+  // preview solve → fuse → W_primer → broadcast to z_init
+  let html='<svg viewBox="0 0 620 90" width="100%" height="100%">';
+  // preview box
+  html+=`<rect x="15" y="30" width="70" height="30" rx="4" fill="rgba(244,114,182,0.15)" stroke="#f472b6"/>`;
+  html+=`<text x="25" y="42" fill="#f472b6" font-size="8">x_preview</text>`;
+  html+=`<text x="25" y="54" fill="#f472b6" font-size="7">(A+ρI)⁻¹b</text>`;
+  // fuse
+  html+=`<rect x="120" y="30" width="60" height="30" rx="4" fill="rgba(244,114,182,0.1)" stroke="#f472b6"/>`;
+  html+=`<text x="130" y="48" fill="#f472b6" font-size="8">fuse → z</text>`;
+  // W_primer
+  html+=`<rect x="225" y="30" width="70" height="30" rx="4" fill="rgba(244,114,182,0.15)" stroke="#f472b6"/>`;
+  html+=`<text x="235" y="48" fill="#f472b6" font-size="8">W_primer</text>`;
+  // z_init broadcast (74 mini boxes)
+  for(let i=0;i<20;i++){html+=`<rect x="${340+i*13}" y="35" width="10" height="20" rx="2" fill="#f472b6" opacity="0.15"><animate attributeName="opacity" values="0.15;0.6;0.15" dur="2s" begin="${i*0.08}s" repeatCount="indefinite"/></rect>`;}
+  html+=`<text x="340" y="70" fill="#f472b6" font-size="8">z_init broadcast → (B,74,32)</text>`;
+  // flowing pulses along the chain
+  const stops=[85,120,225,340];
+  for(let i=0;i<4;i++){
+   html+=`<circle cx="${stops[0]}" cy="45" r="3" fill="#f472b6"><animate attributeName="cx" values="${stops.join(';')}" dur="2s" begin="${i*0.5}s" repeatCount="indefinite"/><animate attributeName="opacity" values="0;1;1;0" dur="2s" begin="${i*0.5}s" repeatCount="indefinite"/></circle>`;
+  }
+  html+='</svg>';el.innerHTML=html;
+ }
+ else if(name==='consensus'){
+  // TALL: 5 substeps animating in sequence with state bars
+  let html='<svg viewBox="0 0 620 200" width="100%" height="100%">';
+  // 8 active columns in a row (top)
+  for(let i=0;i<8;i++){
+   const x=40+i*65, y=20;
+   html+=`<rect x="${x}" y="${y}" width="40" height="30" rx="4" fill="rgba(34,211,238,0.1)" stroke="#22d3ee" stroke-width="1.5"/>`;
+   html+=`<text x="${x+8}" y="${y+19}" fill="#22d3ee" font-size="12" font-family="monospace" font-weight="bold">?</text>`;
+   // opinion converges to 9
+   const guesses=[3,7,9,0,5,9,4,8];
+   html+=`<text x="${x+8}" y="${y+19}" fill="#22d3ee" font-size="12" font-family="monospace" font-weight="bold" opacity="0">
+     <animate attributeName="opacity" values="0;0;1" dur="6s" begin="${i*0.3}s" fill="freeze"/>
+     <set attributeName="textContent" to="9" begin="${3+i*0.4}s"/></text>`;
+  }
+  // round counter
+  html+=`<text x="250" y="75" fill="#22d3ee" font-size="14" font-family="monospace" font-weight="bold" text-anchor="middle">
+    <animate attributeName="textContent" values="Round 1;Round 5;Round 10;Round 15;Round 20" dur="6s" repeatCount="indefinite" keyTimes="0;0.25;0.5;0.75;1"/></text>`;
+  // state bars: z, x, u, motor
+  const bars=[{label:'z',col:'#22d3ee',max:85},{label:'x',col:'#a78bfa',max:75},{label:'u',col:'#fb923c',max:68},{label:'motor',col:'#f43f5e',max:27}];
+  bars.forEach((b,i)=>{
+   const by=95+i*22;
+   html+=`<text x="15" y="${by+12}" fill="${b.col}" font-size="10" font-family="monospace">${b.label}</text>`;
+   html+=`<rect x="40" y="${by}" width="400" height="14" rx="3" fill="#1a1a24" stroke="#27272a"/>`;
+   html+=`<rect x="40" y="${by}" width="0" height="14" rx="3" fill="${b.col}">
+     <animate attributeName="width" values="0;${b.max*4};${b.max*4}" dur="6s" repeatCount="indefinite" keyTimes="0;0.8;1"/></rect>`;
+  });
+  // convergence meter
+  html+=`<text x="15" y="190" fill="#71717a" font-size="8">CONVERGENCE</text>`;
+  html+=`<rect x="120" y="180" width="400" height="10" rx="3" fill="#1a1a24" stroke="#27272a"/>`;
+  html+=`<rect x="120" y="180" width="0" height="10" rx="3" fill="#4ade80">
+    <animate attributeName="width" values="0;400" dur="6s" repeatCount="indefinite"/></rect>`;
+  html+=`<text x="530" y="189" fill="#4ade80" font-size="9">100% agreed</text>`;
+  // synapse pulses between columns
+  for(let i=0;i<7;i++){
+   html+=`<circle cx="${80+i*65}" cy="35" r="2" fill="#4ade80"><animate attributeName="cx" values="${80+i*65};${80+(i+1)*65}" dur="1s" begin="${i*0.2}s" repeatCount="indefinite"/><animate attributeName="opacity" values="0;1;0" dur="1s" repeatCount="indefinite"/></circle>`;
+  }
+  // motor arrows on columns
+  for(let i=0;i<8;i++){
+   const x=60+i*65;
+   html+=`<line x1="${x}" y1="35" x2="${x+8}" y2="${35+8}" stroke="#fb923c" stroke-width="2" opacity="0"><animate attributeName="opacity" values="0;0;0.8;0" dur="6s" begin="0;0;${2+i*0.2};6" repeatCount="indefinite"/><animateTransform attributeName="transform" type="rotate" from="0 ${x} 35" to="360 ${x} 35" dur="3s" repeatCount="indefinite"/></line>`;
+  }
+  html+='</svg>';el.innerHTML=html;
+ }
+ else if(name==='decode_b'){
+  // 8 vote bars rising (only active columns), then fused
+  let html='<svg viewBox="0 0 620 90" width="100%" height="100%">';
+  // 8 column votes
+  for(let i=0;i<8;i++){
+   const x=20+i*30;
+   html+=`<rect x="${x}" y="75" width="20" height="0" fill="#818cf8" rx="2">
+     <animate attributeName="height" values="0;${30+Math.random()*30}" dur="1.5s" begin="${i*0.1}s" fill="freeze"/>
+     <animate attributeName="y" values="75;${75-(30+Math.random()*30)}" dur="1.5s" begin="${i*0.1}s" fill="freeze"/></rect>`;
+   html+=`<text x="${x+4}" y="85" fill="#71717a" font-size="7">C${i+1}</text>`;
+  }
+  // arrow to fusion
+  html+=`<line x1="270" y1="45" x2="340" y2="45" stroke="#818cf8" stroke-width="1.5" marker-end="url(#arrr)"/>`;
+  html+=`<defs><marker id="arrr" markerWidth="6" markerHeight="6" refX="5" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6" fill="#818cf8"/></marker></defs>`;
+  // sparse fuse box
+  html+=`<rect x="345" y="25" width="80" height="40" rx="6" fill="rgba(129,140,248,0.15)" stroke="#818cf8" stroke-width="2"/>`;
+  html+=`<text x="358" y="42" fill="#818cf8" font-size="9">sparse</text>`;
+  html+=`<text x="358" y="54" fill="#818cf8" font-size="9">fuse</text>`;
+  // output bars (10 classes)
+  for(let i=0;i<10;i++){
+   const x=450+i*16, h=i===9?50:10+Math.random()*15;
+   html+=`<rect x="${x}" y="${75-h}" width="12" height="${h}" fill="${i===9?'#34d399':'#818cf8'}" rx="1" opacity="0">
+     <animate attributeName="opacity" values="0;1" dur="0.5s" begin="${1.5+i*0.05}s" fill="freeze"/></rect>`;
+   html+=`<text x="${x+1}" y="85" fill="#71717a" font-size="6">${i}</text>`;
+  }
+  html+=`<text x="450" y="20" fill="#818cf8" font-size="9">pred_bottom (B,10)</text>`;
+  html+='</svg>';el.innerHTML=html;
+ }
+ else if(name==='abs_enc'){
+  // fused z flows into 8 abstract boxes, 4 selected
+  let html='<svg viewBox="0 0 620 90" width="100%" height="100%">';
+  // fused z box
+  html+=`<rect x="15" y="30" width="70" height="30" rx="4" fill="rgba(251,191,36,0.15)" stroke="#fbbf24"/>`;
+  html+=`<text x="25" y="42" fill="#fbbf24" font-size="9">fused z</text>`;
+  html+=`<text x="25" y="54" fill="#fbbf24" font-size="7">(B,32)</text>`;
+  // flowing pulse
+  for(let i=0;i<3;i++){
+   html+=`<circle cx="85" cy="45" r="3" fill="#fbbf24"><animate attributeName="cx" from="85" to="160" dur="1s" begin="${i*0.3}s" repeatCount="indefinite"/><animate attributeName="opacity" values="0;1;0" dur="1s" begin="${i*0.3}s" repeatCount="indefinite"/></circle>`;
+  }
+  // 8 abstract columns in a row
+  for(let i=0;i<8;i++){
+   const x=170+i*45, sel=i<4;
+   html+=`<rect x="${x}" y="25" width="36" height="40" rx="5" fill="${sel?'rgba(251,191,36,0.2)':'#1a1a24'}" stroke="${sel?'#fbbf24':'#3f3f46'}" stroke-width="${sel?2:1}"/>`;
+   html+=`<text x="${x+10}" y="48" fill="${sel?'#fbbf24':'#52525b'}" font-size="11" font-family="monospace" font-weight="bold">A${i+1}</text>`;
+   if(sel){
+    html+=`<rect x="${x-3}" y="22" width="42" height="46" rx="6" fill="none" stroke="#d29922" stroke-width="1" stroke-dasharray="3,3">
+      <animate attributeName="opacity" values="0.4;1;0.4" dur="1.5s" repeatCount="indefinite"/></rect>`;
+   }
+  }
+  html+=`<text x="170" y="80" fill="#fbbf24" font-size="9">top-4 selected (dashed ring)</text>`;
+  html+='</svg>';el.innerHTML=html;
+ }
+ else if(name==='abs_con'){
+  // mini 5-round convergence: 8 boxes show guesses → settle on 9
+  let html='<svg viewBox="0 0 620 90" width="100%" height="100%">';
+  const guesses=[9,9,3,0,9,6,9,8];
+  for(let i=0;i<8;i++){
+   const x=30+i*60, y=25, sel=i<4||i===4&&false;
+   const final = sel?9:guesses[i];
+   html+=`<rect x="${x}" y="${y}" width="36" height="36" rx="5" fill="rgba(251,191,36,0.1)" stroke="#fbbf24" stroke-width="${sel?2:1}"/>`;
+   html+=`<text x="${x+10}" y="${y+24}" fill="#fbbf24" font-size="14" font-family="monospace" font-weight="bold">
+     <animate attributeName="textContent" values="${guesses[i]};${guesses[i]};9" dur="3s" keyTimes="0;0.5;1" repeatCount="indefinite"/></text>`;
+  }
+  // round counter
+  html+=`<text x="280" y="80" fill="#fbbf24" font-size="11" font-family="monospace" font-weight="bold">
+    <animate attributeName="textContent" values="Round 1/5;Round 3/5;Round 5/5" dur="3s" repeatCount="indefinite"/></text>`;
+  // synapse pulses
+  for(let i=0;i<7;i++){
+   html+=`<circle cx="${48+i*60}" cy="43" r="2" fill="#fbbf24"><animate attributeName="cx" values="${48+i*60};${48+(i+1)*60}" dur="0.8s" begin="${i*0.15}s" repeatCount="indefinite"/><animate attributeName="opacity" values="0;1;0" dur="0.8s" repeatCount="indefinite"/></circle>`;
+  }
+  html+='</svg>';el.innerHTML=html;
+ }
+ else if(name==='abs_dec'){
+  // abstract vote bars
+  let html='<svg viewBox="0 0 620 90" width="100%" height="100%">';
+  for(let i=0;i<4;i++){
+   const x=20+i*30;
+   html+=`<rect x="${x}" y="75" width="20" height="0" fill="#fbbf24" rx="2">
+     <animate attributeName="height" values="0;${35+Math.random()*20}" dur="1.2s" begin="${i*0.1}s" fill="freeze"/>
+     <animate attributeName="y" values="75;${75-(35+Math.random()*20)}" dur="1.2s" begin="${i*0.1}s" fill="freeze"/></rect>`;
+  }
+  html+=`<line x1="160" y1="45" x2="230" y2="45" stroke="#fbbf24" marker-end="url(#ad)"/>`;
+  html+=`<defs><marker id="ad" markerWidth="6" markerHeight="6" refX="5" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6" fill="#fbbf24"/></marker></defs>`;
+  html+=`<rect x="235" y="25" width="70" height="40" rx="6" fill="rgba(251,191,36,0.15)" stroke="#fbbf24"/>`;
+  html+=`<text x="245" y="48" fill="#fbbf24" font-size="9">fuse</text>`;
+  for(let i=0;i<10;i++){
+   const x=330+i*16, h=i===9?45:8+Math.random()*12;
+   html+=`<rect x="${x}" y="${75-h}" width="12" height="${h}" fill="${i===9?'#fbbf24':'#d29922'}" rx="1" opacity="0">
+     <animate attributeName="opacity" values="0;1" dur="0.5s" begin="${1+i*0.05}s" fill="freeze"/></rect>`;
+   html+=`<text x="${x+1}" y="85" fill="#71717a" font-size="6">${i}</text>`;
+  }
+  html+=`<text x="330" y="20" fill="#fbbf24" font-size="9">pred_abstract (B,10)</text>`;
+  html+='</svg>';el.innerHTML=html;
+ }
+ else if(name==='fusion'){
+  // two streams (blue bottom + gold abstract) merging into pred
+  let html='<svg viewBox="0 0 620 90" width="100%" height="100%">';
+  // bottom stream
+  html+=`<rect x="15" y="20" width="90" height="22" rx="4" fill="rgba(129,140,248,0.15)" stroke="#818cf8"/>`;
+  html+=`<text x="30" y="35" fill="#818cf8" font-size="9">pred_bottom</text>`;
+  // abstract stream
+  html+=`<rect x="15" y="50" width="90" height="22" rx="4" fill="rgba(251,191,36,0.15)" stroke="#fbbf24"/>`;
+  html+=`<text x="28" y="65" fill="#fbbf24" font-size="9">pred_abstract</text>`;
+  // flowing dots merging
+  for(let i=0;i<3;i++){
+   html+=`<circle cx="105" cy="31" r="3" fill="#818cf8"><animate attributeName="cx" from="105" to="260" dur="1s" begin="${i*0.3}s" repeatCount="indefinite"/><animate attributeName="cy" values="31;45;45" dur="1s" repeatCount="indefinite"/><animate attributeName="opacity" values="0;1;0" dur="1s" begin="${i*0.3}s" repeatCount="indefinite"/></circle>`;
+   html+=`<circle cx="105" cy="61" r="3" fill="#fbbf24"><animate attributeName="cx" from="105" to="260" dur="1s" begin="${i*0.3}s" repeatCount="indefinite"/><animate attributeName="cy" values="61;45;45" dur="1s" repeatCount="indefinite"/><animate attributeName="opacity" values="0;1;0" dur="1s" begin="${i*0.3}s" repeatCount="indefinite"/></circle>`;
+  }
+  // merge node (+)
+  html+=`<circle cx="270" cy="45" r="16" fill="rgba(244,63,94,0.15)" stroke="#f43f5e" stroke-width="2"/>`;
+  html+=`<text x="263" y="50" fill="#f43f5e" font-size="18" font-weight="bold">+</text>`;
+  // output
+  html+=`<rect x="320" y="30" width="90" height="30" rx="5" fill="rgba(244,63,94,0.15)" stroke="#f43f5e" stroke-width="2"/>`;
+  html+=`<text x="335" y="50" fill="#f43f5e" font-size="11" font-weight="bold">pred (B,10)</text>`;
+  // flowing to output
+  for(let i=0;i<2;i++){
+   html+=`<circle cx="286" cy="45" r="3" fill="#f43f5e"><animate attributeName="cx" from="286" to="320" dur="0.6s" begin="${i*0.4}s" repeatCount="indefinite"/><animate attributeName="opacity" values="0;1;0" dur="0.6s" begin="${i*0.4}s" repeatCount="indefinite"/></circle>`;
+  }
+  // 10 class bars
+  for(let i=0;i<10;i++){
+   const x=440+i*16, h=i===9?55:10+Math.random()*15;
+   html+=`<rect x="${x}" y="${75-h}" width="12" height="${h}" fill="${i===9?'#f43f5e':'#a1a1aa'}" rx="1" opacity="0">
+     <animate attributeName="opacity" values="0;1" dur="0.4s" begin="${1.2+i*0.05}s" fill="freeze"/></rect>`;
+   html+=`<text x="${x+1}" y="85" fill="#71717a" font-size="6">${i}</text>`;
+  }
+  html+='</svg>';el.innerHTML=html;
+ }
+ else if(name==='output'){
+  // 10 class neurons, bar 9 fires red/green and wins
+  let html='<svg viewBox="0 0 620 90" width="100%" height="100%">';
+  const scores=[4,9,5,11,4,6,13,8,18,62];
+  for(let i=0;i<10;i++){
+   const x=30+i*55, winner=i===9;
+   // neuron circle
+   html+=`<circle cx="${x}" cy="25" r="10" fill="${winner?'#34d399':'#1a2a4a'}" stroke="${winner?'#34d399':'#2a3a5a'}" stroke-width="2">
+     <animate attributeName="r" values="${winner?'10;13;10':'10;10'}" dur="${winner?1:2}s" repeatCount="indefinite"/></circle>`;
+   html+=`<text x="${x-3}" y="29" fill="${winner?'#0a0a12':'#94a3b8'}" font-size="9" font-weight="bold">${i}</text>`;
+   // bar
+   const bw=40, bh=scores[i]*0.6;
+   html+=`<rect x="${x-bw/2}" y="${75-bh}" width="${bw}" height="${bh}" fill="${winner?'#34d399':'#3f3f46'}" rx="3" opacity="0">
+     <animate attributeName="opacity" values="0;1" dur="0.5s" begin="${i*0.08}s" fill="freeze"/></rect>`;
+   html+=`<text x="${x-6}" y="85" fill="${winner?'#34d399':'#71717a'}" font-size="8" font-family="monospace">${scores[i]}%</text>`;
+   // dendrites
+   for(let a=0;a<5;a++){const ang=(a/5)*Math.PI*2;
+    html+=`<line x1="${x}" y1="25" x2="${x+Math.cos(ang)*16}" y2="${25+Math.sin(ang)*16}" stroke="${winner?'rgba(52,211,153,0.5)':'rgba(100,116,139,0.3)'}" stroke-width="0.8"/>`;}
+  }
+  html+=`<text x="280" y="15" fill="#34d399" font-size="11" font-weight="bold">✓ Winner: class 9</text>`;
+  // argmax arrow
+  html+=`<text x="280" y="50" fill="#a1a1aa" font-size="9">argmax(pred) → class</text>`;
+  html+='</svg>';el.innerHTML=html;
+ }
+}
+
+// ════════════════════════════════════════════════════════════════
+// Activate step
+// ════════════════════════════════════════════════════════════════
+function activateStep(idx){
+ stopAllAnims();
+ // cards
+ steps.forEach((s,i)=>{
+  const card=document.getElementById('card-'+i);
+  if(i===idx){card.classList.add('active');card.style.opacity='1';card.scrollIntoView({behavior:'smooth',block:'center'});}
+  else if(i<idx){card.classList.remove('active');card.style.opacity='0.6';}
+  else{card.classList.remove('active');card.style.opacity='0.3';}
+ });
+ // arrows
+ for(let i=1;i<steps.length;i++){const a=document.getElementById('arrow-'+i);if(a){if(i<=idx)a.classList.add('active');else a.classList.remove('active');}}
+ // substeps for consensus
+ if(steps[idx].substeps){
+  let ssIdx=0;const subs=steps[idx].substeps;
+  const t=setInterval(()=>{
+   if(ssIdx>0){const p=document.getElementById('ss-'+idx+'-'+subs[ssIdx-1].num);if(p)p.classList.remove('active');}
+   if(ssIdx<subs.length){const c=document.getElementById('ss-'+idx+'-'+subs[ssIdx].num);if(c)c.classList.add('active');ssIdx++;}
+   else clearInterval(t);
+  },700/speed);animTimers.push(t);
+ }
+ // nav
+ steps.forEach((s,i)=>{const e=document.getElementById('nav-'+i);if(e){if(i===idx)e.classList.add('active');else e.classList.remove('active');}});
+ // progress
+ document.getElementById('progFill').style.width=(idx/(steps.length-1)*100)+'%';
+ // detail
+ const dp=document.getElementById('detailPanel');dp.className='detail-panel '+steps[idx].theme;dp.innerHTML=steps[idx].detail;
+ // start animation for this step
+ setTimeout(()=>startAnim(steps[idx].anim),100);
+}
+
+// ════════════════════════════════════════════════════════════════
+// Playback
+// ════════════════════════════════════════════════════════════════
+function togglePlay(){const b=document.getElementById('btnPlay');if(isPlaying){isPlaying=false;clearTimeout(playTimer);b.textContent='▶ Play';}
+ else{if(currentIdx>=steps.length-1)currentIdx=0;isPlaying=true;b.textContent='⏸ Pause';playNext();}}
+function playNext(){if(!isPlaying)return;if(currentIdx>=steps.length){isPlaying=false;document.getElementById('btnPlay').textContent='↺ Replay';return;}
+ activateStep(currentIdx);const dwell=steps[currentIdx].substeps?5000:3000;currentIdx++;playTimer=setTimeout(playNext,dwell/speed);}
+function jumpTo(idx){isPlaying=false;clearTimeout(playTimer);document.getElementById('btnPlay').textContent='▶ Play';currentIdx=idx;activateStep(idx);}
+
+// controls
+document.getElementById('btnPlay').addEventListener('click',togglePlay);
+document.getElementById('btnReset').addEventListener('click',()=>{isPlaying=false;clearTimeout(playTimer);document.getElementById('btnPlay').textContent='▶ Play';currentIdx=0;activateStep(0);});
+document.getElementById('btnNext').addEventListener('click',()=>{isPlaying=false;clearTimeout(playTimer);document.getElementById('btnPlay').textContent='▶ Play';if(currentIdx<steps.length-1){currentIdx++;activateStep(currentIdx);}});
+document.getElementById('btnPrev').addEventListener('click',()=>{isPlaying=false;clearTimeout(playTimer);document.getElementById('btnPlay').textContent='▶ Play';if(currentIdx>0){currentIdx--;activateStep(currentIdx);}});
+document.getElementById('speed').addEventListener('input',e=>{speed=parseFloat(e.target.value);document.getElementById('speedLabel').textContent=speed+'x';});
+document.addEventListener('keydown',e=>{if(e.key===' '){e.preventDefault();togglePlay();}else if(e.key==='ArrowRight')document.getElementById('btnNext').click();else if(e.key==='ArrowLeft')document.getElementById('btnPrev').click();});
+
+// init
+buildFlowchart();buildNav();activateStep(0);
+</script>
+</body>
+</html>
