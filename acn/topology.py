@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import torch
 
-from acn.decomposition import Decomposition
+from acn.decomposition import Decomposition, ColumnSpec
 
 
 def build_spatial_neighbors(
@@ -70,6 +70,45 @@ def build_all_pairs(num_nodes: int) -> torch.Tensor:
     """
     idx = torch.triu_indices(num_nodes, num_nodes, offset=1)  # (2, E)
     return idx.contiguous()
+
+
+def build_multi_scale_neighbors(
+    roster: list[ColumnSpec], overlap_min: int = 1
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build edges between overlapping patches of DIFFERENT sizes.
+
+    Two columns are neighbors iff their patches (which may be different sizes)
+    overlap by >= overlap_min pixels on BOTH axes. This generalizes
+    :func:`build_spatial_neighbors` to mixed receptive fields.
+
+    A small 4x4 patch can be entirely inside a big 8x8 patch — that counts as
+    neighbors (they share pixels). The Physarum dynamics decide which wires
+    actually matter.
+
+    Returns:
+      edges: (2, E) long tensor of (i, j) with i < j, undirected, no self-loops.
+      overlap: (E,) float tensor of the min-overlap-along-both-axes per edge
+               (used for conductance init).
+    """
+    N = len(roster)
+    ei_list, ej_list, ov_list = [], [], []
+    for i in range(N):
+        si, ri, ci = roster[i].size, roster[i].row, roster[i].col
+        for j in range(i + 1, N):
+            sj, rj, cj = roster[j].size, roster[j].row, roster[j].col
+            # rectangle intersection along both axes (patches may differ in size)
+            overlap_r = max(0, min(ri + si, rj + sj) - max(ri, rj))
+            overlap_c = max(0, min(ci + si, cj + sj) - max(ci, cj))
+            ov = min(overlap_r, overlap_c)
+            if ov >= overlap_min:
+                ei_list.append(i)
+                ej_list.append(j)
+                ov_list.append(float(ov))
+    if not ei_list:
+        return torch.zeros(2, 0, dtype=torch.long), torch.zeros(0)
+    edges = torch.tensor([ei_list, ej_list], dtype=torch.long)  # (2, E)
+    overlap = torch.tensor(ov_list, dtype=torch.float32)        # (E,)
+    return edges, overlap
 
 
 def edge_to_pair_index(edges: torch.Tensor, device: torch.device | None = None) -> torch.Tensor:

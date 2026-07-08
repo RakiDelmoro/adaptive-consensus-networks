@@ -1,537 +1,609 @@
-"""Visualizations for ACN interpretable state.
+"""ACN — Decision Confidence Visualization.
 
-All functions take a :class:`acn.inspect.StateSnapshot` (or list of them) and a path,
-and write a PNG. Kept dependency-light (matplotlib only).
+A per-sample animated GIF showing the model's DECISION CONFIDENCE as a simple
+2x5 grid of boxes (digits 0-9):
+
+  1. Input digit  (ground truth + ✓/✗ tag)
+  2. A 2x5 grid where each cell = one digit (0-4 on top, 5-9 on bottom):
+       * blank (black) if the model's softmax confidence for that digit is < 50%
+         (it's not confident enough to be part of the decision)
+       * colored with that digit's label color if confidence >= 50%, with
+         brightness rising from dim (at 50%) to full bright (at 100%) — so the
+         STRENGTH OF THE COLOR IS THE CONFIDENCE.
+     The model's predicted digit (argmax) always gets a green border so the
+     decision is visible even when nothing crosses 50%. The percentage is
+     printed in each lit cell.
+
+As the consensus rounds animate, a digit crosses 50% and its cell brightens —
+you watch the decision form. The bottom/top column grids and the weighted-vote
+bars are intentionally NOT shown; the 2x5 confidence grid is the whole story.
+
+Two entry points (signatures unchanged so scripts/viz_spotlight.py still works):
+  * :func:`make_spotlight_gif`            — one row per digit class (0-9), batched 4/batch
+  * :func:`make_robustness_spotlight_gif` — one digit under 8 corruptions, batched 4/batch
 """
-
 from __future__ import annotations
 
 from pathlib import Path
 
 import numpy as np
+import torch
+import torch.nn.functional as F
+from PIL import Image
 
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+from matplotlib.animation import PillowWriter
 
-from acn.inspect import StateSnapshot, conductance_matrix
 
+class _PlayOncePillowWriter(PillowWriter):
+    """PillowWriter that writes loop=1 (play once, then hold the last frame)
+    instead of the default loop=0 (infinite loop).
 
-# --------------------------------------------------------------------------- #
-# Consensus-grid visualization (Sakana sheaf-ADMM style)
-# --------------------------------------------------------------------------- #
+    So the GIF plays the consensus rounds once, lingers on the final converged
+    state, and stops there — it does NOT restart. Reopening the file replays it.
+    """
+    def finish(self):
+        self._frames[0].save(
+            self.outfile, save_all=True, append_images=self._frames[1:],
+            duration=int(1000 / self.fps), loop=1)
 
-# 10 distinct colors for digits 0-9. 0=red, 1=blue, 2=green per request.
+# 10 distinct colors for digits 0-9
 DIGIT_COLORS = [
-    (1.00, 0.20, 0.20),  # 0 red
-    (0.20, 0.40, 1.00),  # 1 blue
-    (0.20, 0.80, 0.30),  # 2 green
-    (1.00, 0.60, 0.10),  # 3 orange
-    (0.70, 0.20, 0.90),  # 4 purple
-    (0.10, 0.80, 0.80),  # 5 cyan
-    (0.95, 0.85, 0.20),  # 6 yellow
-    (0.85, 0.40, 0.70),  # 7 pink
-    (0.45, 0.25, 0.15),  # 8 brown
-    (0.50, 0.50, 0.55),  # 9 grey
+    "#ef4444", "#3b82f6", "#22c55e", "#f97316", "#a855f7",
+    "#06b6d4", "#eab308", "#ec4899", "#78350f", "#6b7280",
 ]
+DIGIT_COLORS_RGB = np.array([
+    [0.937, 0.247, 0.247],  # 0 red
+    [0.231, 0.510, 0.965],  # 1 blue
+    [0.133, 0.773, 0.369],  # 2 green
+    [0.976, 0.451, 0.094],  # 3 orange
+    [0.659, 0.333, 0.890],  # 4 purple
+    [0.024, 0.714, 0.831],  # 5 cyan
+    [0.918, 0.702, 0.031],  # 6 yellow
+    [0.925, 0.282, 0.600],  # 7 pink
+    [0.471, 0.208, 0.059],  # 8 brown
+    [0.420, 0.439, 0.502],  # 9 gray
+], dtype=np.float32)
 
 
-def digit_color_grid(preds: np.ndarray) -> np.ndarray:
-    """Map (Hg, Wg) int predictions -> (Hg, Wg, 3) RGB color grid."""
-    Hg, Wg = preds.shape
-    rgb = np.zeros((Hg, Wg, 3))
-    for v in range(10):
-        rgb[preds == v] = DIGIT_COLORS[v]
-    return rgb
+# ════════════════════════════════════════════════════════════════════
+# V3-specific snapshot: extract everything the GIF needs (both layers)
+# ════════════════════════════════════════════════════════════════════
 
+class V3Snapshot:
+    """Holds all interpretable state from a ACN forward pass, both layers.
 
-def decode_history_predictions(model, snap: StateSnapshot, return_confidence: bool = False,
-                               return_logits: bool = False):
-    """Decode per-round per-node logits from snap.history.
-
-    Returns (R, B, N) int array of argmax digit per neuron per round, where R is
-    the number of recorded consensus rounds. Uses the model's decoder on each
-    round's z (no grad). Requires snap.history (record=True during snapshot).
-
-    If return_confidence=True, also returns (R, B, N) float array of confidence
-    per neuron per round (in [0,1]). We use the normalized LOGIT MARGIN
-    (top1 - top2) instead of max-softmax because softmax saturates (~0.9-0.998
-    for every cell, no usable range). Margin has 1600x range: a blank patch has
-    near-zero margin (no clear winner), a stroke patch has a large margin. We
-    normalize per-batch by the max margin so the strongest cell -> 1.0.
-
-    If return_logits=True, also returns (R, B, N, C) float array of the RAW
-    per-column logits per round. Used by the fused-scorecard bar chart in
-    make_consensus_gif so viewers can see the soft scorecard that actually
-    drives the judgment (not just each column's argmax color).
+    Decodes per-round per-column logits for BOTH the bottom layer and the
+    abstract layer so the grids can animate over consensus rounds.
     """
-    import torch
-    if snap.history is None:
-        raise ValueError("snapshot has no history; re-run with record=True")
-    R = len(snap.history)
-    B, N, d = snap.z.shape
-    C = model.decoder.mlp[-1].out_features
-    device = next(model.parameters()).device
-    preds = np.zeros((R, B, N), dtype=np.int64)
-    confs = np.zeros((R, B, N), dtype=np.float32) if return_confidence else None
-    logits_all = np.zeros((R, B, N, C), dtype=np.float32) if return_logits else None
-    with torch.no_grad():
-        for k, h in enumerate(snap.history):
-            z = torch.from_numpy(h["z"]).to(device).float()
-            logits = model.decoder(z)              # (B, N, C)
-            preds[k] = logits.argmax(-1).cpu().numpy()
-            if return_confidence:
-                top2 = torch.topk(logits, 2, dim=-1).values  # (B, N, 2)
-                margin = (top2[..., 0] - top2[..., 1]).clamp(min=0)  # (B, N)
-                mx = margin.amax(dim=1, keepdim=True) + 1e-6
-                confs[k] = (margin / mx).cpu().numpy()
-            if return_logits:
-                logits_all[k] = logits.cpu().numpy()
-    if return_confidence and return_logits:
-        return preds, confs, logits_all
-    if return_logits:
-        return preds, logits_all
-    if return_confidence:
-        return preds, confs
-    return preds
+    def __init__(self, model, images, record=True):
+        was_training = model.training
+        model.eval()
+        with torch.no_grad():
+            pred, (state_bottom, state_abstract) = model(images, record=record)
+
+        device = next(model.parameters()).device
+
+        self.pred = pred.cpu().numpy()                       # (B, 10)
+        self.pred_class = pred.argmax(-1).cpu().numpy()      # (B,)
+
+        # ── bottom layer ──
+        self.active = state_bottom.active.cpu().numpy()      # (B, N)
+        self.N = state_bottom.active.shape[1]
+
+        # per-round bottom history (decoded into logits + argmax + active)
+        self.bottom_logits_round = None      # (R, B, N, C)
+        self.bottom_choices_round = None     # (R, B, N)
+        self.bottom_active_round = None      # (R, B, N)
+        self.bottom_fused_round = None       # (R, B, C)
+        if state_bottom.history:
+            logits_list = []
+            active_list = []
+            for h in state_bottom.history:
+                z_t = h["z"].to(device).float()
+                lg = model.bottom_decoder(z_t).detach().cpu().numpy()  # (B, N, C)
+                logits_list.append(lg)
+                active_list.append(h["active"].cpu().numpy())          # (B, N)
+            self.bottom_logits_round = np.stack(logits_list)           # (R, B, N, C)
+            self.bottom_active_round = np.stack(active_list)           # (R, B, N)
+            self.bottom_choices_round = self.bottom_logits_round.argmax(-1)  # (R, B, N)
+            self.bottom_fused_round = _sparse_fuse_np(
+                self.bottom_logits_round, self.bottom_active_round)    # (R, B, C)
+
+        # final bottom (for static fallback if no history)
+        self.logits_bottom = model.bottom_decoder(state_bottom.z).detach().cpu().numpy()
+        self.bottom_choices = self.logits_bottom.argmax(-1)            # (B, N)
+        self.bottom_fused = _sparse_fuse_np(
+            self.logits_bottom[None], self.active[None])[0]            # (B, C)
+
+        # ── abstract layer ──
+        self.has_abstract = state_abstract is not None
+        if self.has_abstract:
+            self.active2 = state_abstract.active.cpu().numpy()         # (B, N2)
+            self.N2 = state_abstract.active.shape[1]
+            self.logits_abstract = model.abstract_decoder(
+                state_abstract.z).detach().cpu().numpy()               # (B, N2, C)
+            self.abstract_choices = self.logits_abstract.argmax(-1)    # (B, N2)
+            self.abstract_fused = _sparse_fuse_np(
+                self.logits_abstract[None], self.active2[None])[0]     # (B, C)
+
+            self.abstract_logits_round = None
+            self.abstract_choices_round = None
+            self.abstract_active_round = None
+            self.abstract_fused_round = None
+            if state_abstract.history:
+                logits_list = []
+                active_list = []
+                for h in state_abstract.history:
+                    z_t = h["z"].to(device).float()
+                    lg = model.abstract_decoder(z_t).detach().cpu().numpy()
+                    logits_list.append(lg)
+                    active_list.append(h["active"].cpu().numpy())
+                self.abstract_logits_round = np.stack(logits_list)     # (R, B, N2, C)
+                self.abstract_active_round = np.stack(active_list)     # (R, B, N2)
+                self.abstract_choices_round = self.abstract_logits_round.argmax(-1)
+                self.abstract_fused_round = _sparse_fuse_np(
+                    self.abstract_logits_round, self.abstract_active_round)  # (R, B, C)
+        else:
+            self.active2 = None
+            self.N2 = 0
+            self.logits_abstract = None
+            self.abstract_choices = None
+            self.abstract_fused = np.zeros_like(self.bottom_fused)
+            self.abstract_logits_round = None
+            self.abstract_choices_round = None
+            self.abstract_active_round = None
+            self.abstract_fused_round = None
+
+        # combined fused per round. In the unified predictive-coding hierarchy both
+        # layers run the SAME number of rounds (hierarchy_rounds) in lockstep, so
+        # the per-round histories are already aligned. Stored as a diagnostic sum
+        # (bottom mean + top mean); the model's actual readout is the
+        # confidence-weighted cooperative vote of the two layers' readouts.
+        if self.bottom_fused_round is not None:
+            abs_aligned = (self.abstract_fused_round if self.abstract_fused_round is not None
+                           else np.zeros_like(self.bottom_fused_round))
+            self.fused_round = abs_aligned + self.bottom_fused_round   # (R, B, C) diagnostic
+        else:
+            self.fused_round = None
+
+        # final combined fused
+        self.fused_final = self.bottom_fused + self.abstract_fused      # (B, C)
+
+        # roster / sizes (for the input-panel spotlight overlay, if wanted)
+        b_topo = model._bottom_topo
+        self.roster = b_topo.roster
+        self.coords = b_topo.coords.cpu().numpy()
+        if self.roster is not None:
+            self.patch_sizes = np.array([s.size for s in self.roster])
+        else:
+            self.patch_sizes = np.full(self.N, model.patch_size)
+
+        if was_training:
+            model.train()
 
 
-def plot_conductance_heatmap(snap: StateSnapshot, path: str | Path, title: str = "Conductance") -> None:
-    M = conductance_matrix(snap)
-    fig, ax = plt.subplots(figsize=(4, 4))
-    im = ax.imshow(M, cmap="viridis", vmin=0, vmax=1)
-    ax.set_title(title)
-    ax.set_xlabel("mini network j"); ax.set_ylabel("mini network i")
-    fig.colorbar(im, ax=ax, fraction=0.046)
-    Path(path).parent.mkdir(parents=True, exist_ok=True)
-    fig.tight_layout(); fig.savefig(path, dpi=120); plt.close(fig)
+# ════════════════════════════════════════════════════════════════════
+# Helpers
+# ════════════════════════════════════════════════════════════════════
 
+def _sparse_fuse_np(logits, active):
+    """Numpy sparse fuse: mean over active columns.
 
-def plot_conductance_evolution(snap: StateSnapshot, path: str | Path) -> None:
-    """D per edge over consensus rounds (requires snap.history)."""
-    if snap.history is None:
-        return
-    rounds = len(snap.history)
-    E = snap.D.shape[1]
-    D_traj = np.zeros((rounds, E))
-    for k, h in enumerate(snap.history):
-        D_traj[k] = h["D"].mean(axis=0)
-    fig, ax = plt.subplots(figsize=(6, 4))
-    ax.plot(np.arange(rounds), D_traj, alpha=0.4, linewidth=0.7)
-    ax.plot(np.arange(rounds), D_traj.mean(axis=1), color="black", linewidth=2, label="mean D")
-    ax.set_xlabel("consensus round"); ax.set_ylabel("conductance D_ij")
-    ax.set_title("Conductance evolution over rounds")
-    ax.legend()
-    Path(path).parent.mkdir(parents=True, exist_ok=True)
-    fig.tight_layout(); fig.savefig(path, dpi=120); plt.close(fig)
-
-
-def plot_u_norm(snap: StateSnapshot, path: str | Path) -> None:
-    if snap.history is None:
-        return
-    rounds = len(snap.history)
-    u_norm = np.zeros(rounds)
-    for k, h in enumerate(snap.history):
-        u_norm[k] = np.linalg.norm(h["u"], axis=-1).mean()
-    fig, ax = plt.subplots(figsize=(5, 3.5))
-    ax.plot(np.arange(rounds), u_norm, marker="o")
-    ax.set_xlabel("consensus round"); ax.set_ylabel("mean ||u_i||")
-    ax.set_title("Stubbornness (dual norm) over rounds")
-    Path(path).parent.mkdir(parents=True, exist_ok=True)
-    fig.tight_layout(); fig.savefig(path, dpi=120); plt.close(fig)
-
-
-def plot_x_z_trajectories(snap: StateSnapshot, path: str | Path, node: int = 0) -> None:
-    if snap.history is None:
-        return
-    rounds = len(snap.history)
-    d = snap.x.shape[-1]
-    x_traj = np.stack([h["x"][:, node, :] for h in snap.history]).mean(axis=1)  # (rounds, d)
-    z_traj = np.stack([h["z"][:, node, :] for h in snap.history]).mean(axis=1)
-    fig, ax = plt.subplots(figsize=(6, 4))
-    for j in range(d):
-        ax.plot(np.arange(rounds), x_traj[:, j], "--", alpha=0.5, linewidth=0.8)
-        ax.plot(np.arange(rounds), z_traj[:, j], "-", alpha=0.8, linewidth=1.2)
-    ax.set_xlabel("consensus round"); ax.set_ylabel("latent dim value")
-    ax.set_title(f"x (dashed) vs z (solid) — node {node}")
-    Path(path).parent.mkdir(parents=True, exist_ok=True)
-    fig.tight_layout(); fig.savefig(path, dpi=120); plt.close(fig)
-
-
-def plot_active_links_on_image(
-    snap: StateSnapshot,
-    image: np.ndarray,
-    patch_size: int,
-    path: str | Path,
-    prune_eps: float = 1e-3,
-) -> None:
-    """Overlay active communication links on the input image."""
-    Dm = conductance_matrix(snap)
-    coords = snap.coords
-    centers = coords + patch_size / 2.0
-    H, W = image.shape[-2:]
-    fig, ax = plt.subplots(figsize=(4, 4))
-    ax.imshow(image, cmap="gray")
-    active = Dm >= prune_eps
-    for i in range(len(coords)):
-        for j in range(i + 1, len(coords)):
-            if active[i, j]:
-                a, b = centers[i], centers[j]
-                ax.plot([a[1], b[1]], [a[0], b[0]], color="red", alpha=float(Dm[i, j]), linewidth=1.5)
-    ax.plot(centers[:, 1], centers[:, 0], "o", color="cyan", markersize=3)
-    ax.set_title("Active links on image")
-    ax.set_xticks([]); ax.set_yticks([])
-    Path(path).parent.mkdir(parents=True, exist_ok=True)
-    fig.tight_layout(); fig.savefig(path, dpi=120); plt.close(fig)
-
-
-# --------------------------------------------------------------------------- #
-# Animated GIF: neuron consensus grid across rounds
-# --------------------------------------------------------------------------- #
-
-
-def _interpolated_preds(
-    preds: np.ndarray, n_between: int, black_start: bool = True,
-    active: np.ndarray | None = None,
-    fused_preds: np.ndarray | None = None,
-) -> np.ndarray:
-    """Linearly interpolate per-neuron colors by blending adjacent rounds' RGB grids.
-
-    `preds` is (R, B, N) int argmax of each column's personal top pick. We map
-    each neuron to its digit color per round, then insert `n_between` cross-fade
-    frames between consecutive rounds. If black_start=True, prepend an all-black
-    round 0 so the GIF opens blank and color fills in as consensus proceeds.
-
-    If `active` is given (R, B, N) in [0,1], INACTIVE columns (active<0.5) are
-    forced to black for every round — they don't vote, so they render as silent
-    black cells (the Thousand-Brains sparse-column figure: the digit's shape
-    emerges in which cells light up against the black background).
-
-    If `fused_preds` is given (R, B) int argmax of the FUSED scorecard per round
-    (the model's global decision), then every ACTIVE cell is colored by that
-    single fused color instead of its per-column personal pick. This is the
-    "one color" view the blueprint describes: all active cells converge to the
-    team's verdict. Inactive cells stay black. Pass None for the diagnostic
-    per-column (distributed opinion) view.
-    Returns (F, B, N, 3) float RGB per neuron.
+    logits: (..., N, C), active: (..., N) -> (..., C)
     """
-    R, B, N = preds.shape
-    colors = np.zeros((R, B, N, 3))
-    for k in range(R):
-        for b in range(B):
-            if fused_preds is not None:
-                # global-decision view: every active cell = the fused argmax color
-                v = int(fused_preds[k, b])
-                colors[k, b] = DIGIT_COLORS[v]
-            else:
-                # distributed-opinion view: each cell = its own personal argmax
-                for v in range(10):
-                    colors[k, b][preds[k, b] == v] = DIGIT_COLORS[v]
-            # black out inactive columns (sparse-column gating)
-            if active is not None:
-                inactive = active[k, b] < 0.5       # (N,) boolean
-                colors[k, b][inactive] = 0.0        # black
-    seq = []
-    if black_start:
-        black = np.zeros((B, N, 3))
-        seq.append(black)
-        for t in range(1, n_between + 1):
-            a = t / (n_between + 1)
-            seq.append((1 - a) * black + a * colors[0])
-    frames = list(seq)
-    for k in range(R - 1):
-        frames.append(colors[k])
-        for t in range(1, n_between + 1):
-            a = t / (n_between + 1)
-            frames.append((1 - a) * colors[k] + a * colors[k + 1])
-    frames.append(colors[-1])
-    return np.stack(frames)
-
-
-def _per_round_fused(logits_per_round: np.ndarray, active_per_round: np.ndarray | None) -> np.ndarray:
-    """Fused (consensus) scorecard per round, matching the actual judgment.
-
-    This is the numpy equivalent of acn.networks.sparse_fuse, applied per round:
-        fused = mean over ACTIVE columns of the raw per-column logits.
-    Returns (R, B, C). This is exactly what the model's argmax runs on to decide
-    correct/wrong — NOT the per-column argmax colors shown in the grid. Exposing
-    it in the viz makes the judging mechanism transparent: a viewer can see WHY
-    the fused winner wins even when most cells' personal top pick differs.
-    """
-    R, B, N, C = logits_per_round.shape
-    if active_per_round is None:
-        # dense fallback: all columns vote equally
-        return logits_per_round.mean(axis=2)
-    w = active_per_round[..., None]                  # (R, B, N, 1)
-    summed = (w * logits_per_round).sum(axis=2)       # (R, B, C)
-    count = w.sum(axis=2).clip(min=1e-6)              # (R, B, 1)
+    w = active[..., None]                          # (..., N, 1)
+    summed = (w * logits).sum(axis=-2)             # (..., C)
+    count = w.sum(axis=-2).clip(min=1e-6)          # (..., 1)
     return summed / count
 
 
-def _interpolated_fused(fused_per_round: np.ndarray, n_between: int, black_start: bool = True) -> np.ndarray:
-    """Interpolate the per-round fused scorecard to match the color-frame timeline.
+def _confidence(pred_logits):
+    """Softmax confidence of the predicted class."""
+    p = np.exp(pred_logits - pred_logits.max(axis=-1, keepdims=True))
+    p /= p.sum(axis=-1, keepdims=True)
+    return p.max(axis=-1)
+def _weighted_vote_data(snap, s: int, round_idx: int):
+    """Collect the cooperative readout data for one sample at one round.
 
-    Mirrors _interpolated_preds so bar-chart frames stay in sync with grid frames.
-    Returns (F, B, C).
+    The model's verdict is a CONFIDENCE-WEIGHTED vote of the two layers:
+        pred = w_top * pred_top + w_bot * pred_bottom
+    where w_top/w_bot are the normalized logit margins (top1-top2) of each
+    layer's fused readout. This helper returns exactly those pieces so the
+    panel can show: each layer's per-digit mean (its vote), each layer's
+    confidence weight (a gauge), and the weighted combination (the verdict,
+    guaranteed to match snap.pred_class).
     """
-    R, B, C = fused_per_round.shape
-    seq = []
-    if black_start:
-        zero = np.zeros((B, C))
-        seq.append(zero)
-        for t in range(1, n_between + 1):
-            a = t / (n_between + 1)
-            seq.append((1 - a) * zero + a * fused_per_round[0])
-    frames = list(seq)
-    for k in range(R - 1):
-        frames.append(fused_per_round[k])
-        for t in range(1, n_between + 1):
-            a = t / (n_between + 1)
-            frames.append((1 - a) * fused_per_round[k] + a * fused_per_round[k + 1])
-    frames.append(fused_per_round[-1])
-    return np.stack(frames)
+    # per-layer fused readouts at this round
+    if snap.bottom_fused_round is not None and round_idx < len(snap.bottom_fused_round):
+        pred_bottom = snap.bottom_fused_round[round_idx, s]    # (C,)
+    else:
+        pred_bottom = snap.bottom_fused[s]
+    if snap.has_abstract and snap.abstract_fused_round is not None \
+            and round_idx < len(snap.abstract_fused_round):
+        pred_top = snap.abstract_fused_round[round_idx, s]     # (C,)
+    else:
+        pred_top = snap.abstract_fused[s]
+
+    # confidence weights = logit margin (top1 - top2), normalized to sum 1
+    def _margin(v):
+        top2 = np.sort(v)[-2:]
+        return max(float(top2[-1] - top2[-2]), 1e-3)
+    w_top_raw = _margin(pred_top) if snap.has_abstract else 0.0
+    w_bot_raw = _margin(pred_bottom)
+    w_sum = w_top_raw + w_bot_raw + 1e-6
+    w_top = w_top_raw / w_sum
+    w_bot = w_bot_raw / w_sum
+
+    # the real verdict = confidence-weighted combination
+    fused = w_top * pred_top + w_bot * pred_bottom            # (C,)
+    winner = int(fused.argmax())
+    return {"pred_top": pred_top, "pred_bottom": pred_bottom,
+            "w_top": w_top, "w_bot": w_bot,
+            "fused": fused, "winner": winner}
+# ════════════════════════════════════════════════════════════════════
+# Figure builder shared by both GIFs
+# ════════════════════════════════════════════════════════════════════
+def _softmax_np(logits):
+    """Softmax over the last axis (numpy). logits: (..., C) -> (..., C)."""
+    x = logits - logits.max(axis=-1, keepdims=True)
+    e = np.exp(x)
+    return e / e.sum(axis=-1, keepdims=True)
 
 
-def make_consensus_gif(
-    model,
-    episodes: list[dict],   # each: {snap, images (B,H,W), labels (B,), sample_kinds (B,), coords, stride}
-    path: str | Path,
-    duration_ms: int = 40,
-    transition_steps: int = 10,
-    linger_frames: int = 75,
-    grid_mode: str = "fused",
-) -> None:
-    """Create a smooth multi-episode GIF showing neuron grids converging.
+def _confidence_grid_rgb(probs, floor=0.30):
+    """Render the 10 digit probabilities as a 2x5 RGB confidence grid.
 
-    Vertical layout: each row = one sample = [input digit (labeled with ground
-    truth only, e.g. "digit 4") | 8x8 Mini networks grid | Mini networks decision
-    bar chart with +/- axis], digit color legend on the right. White borders
-    around every cell so the grid is visibly distinct. Black round-0 start;
-    cross-fade transitions between rounds; linger on the converged result before
-    the next batch.
-
-    The per-row label shows only the ground-truth digit (no correct/wrong tag).
-    The right-side color legend maps each digit to its color, so the viewer can
-    tell whether the model is correct by comparing the grid/bars' winning color
-    to the legend entry for the labeled digit.
-
-    grid_mode controls what the grid colors show:
-      - "fused" (default): every ACTIVE cell is colored by the FUSED argmax =
-        the model's global decision. All active cells share one color (the
-        blueprint's "converges to one color"). Inactive cells stay black. This
-        is the team's verdict and is always consistent with the correct/wrong
-        tag. THIS is what the architecture decides.
-      - "per_column": each cell is colored by its OWN argmax (its personal top
-        pick). Shows the distributed opinion of the 64 independent experts and
-        how they (softly) move during consensus. Cells may differ in color even
-        when the fused decision is one color — useful for diagnosing whether
-        consensus is converging, but can look inconsistent with the tag.
-
-    The fused-scorecard bar chart (3rd column) shows the ACTUAL judging signal:
-    the mean of raw per-column logits over active columns, per digit slot, with
-    a labeled +/- horizontal axis so it's clear where zero is. The model's
-    prediction = argmax of this scorecard. Bars are colored by digit; the
-    winner is drawn at full alpha with a black edge, others dimmed.
+    Each cell = one digit (row-major: 0..4 on top, 5..9 on bottom).
+      * prob < 0.5  -> BLANK (black): the model isn't confident enough in that
+        digit for it to be part of the decision.
+      * prob >= 0.5 -> the digit's label COLOR, brightness rising from `floor`
+        (dim, at 50%) to 1.0 (full bright, at 100%). So a just-over-50% cell is
+        a dim version of its color and a 95% cell is full-bright — the strength
+        of the color IS the confidence.
     """
-    from matplotlib.animation import PillowWriter
+    grid = np.zeros((2, 5, 3), dtype=np.float32)
+    for d in range(10):
+        r, c = d // 5, d % 5
+        p = float(probs[d])
+        if p >= 0.5:
+            b = floor + (1.0 - floor) * ((p - 0.5) / 0.5)
+            grid[r, c] = DIGIT_COLORS_RGB[d] * b
+    return grid
 
-    if not episodes:
-        raise ValueError("need at least one episode")
-    nsamp = len(episodes[0]["images"])
-    coords = episodes[0]["coords"]
-    stride = episodes[0]["stride"]
-    Hg = int(coords[:, 0].max() // stride + 1)
-    Wg = int(coords[:, 1].max() // stride + 1)
 
-    # --- precompute each episode's interpolated color frames + fused scorecards ---
-    ep_data = []
-    for ep in episodes:
-        preds, logits_per_round = decode_history_predictions(model, ep["snap"], return_logits=True)
-        R = preds.shape[0]
-        # per-round active mask from history (B, N) per round -> (R, B, N)
-        active_per_round = None
-        if ep["snap"].history is not None and "active" in ep["snap"].history[0]:
-            active_per_round = np.stack([h["active"] for h in ep["snap"].history])
-        # fused scorecard per frame (the ACTUAL judging signal; see _per_round_fused)
-        fused_per_round = _per_round_fused(logits_per_round, active_per_round)   # (R, B, C)
-        fused_argmax_per_round = fused_per_round.argmax(axis=-1)                 # (R, B) global decision per round
-        fused_frames = _interpolated_fused(fused_per_round, n_between=transition_steps, black_start=True)
-        # grid colors: fused global decision (one color) unless user asked for per_column diagnostic view
-        grid_fused_preds = fused_argmax_per_round if grid_mode == "fused" else None
-        color_frames = _interpolated_preds(
-            preds, n_between=transition_steps, black_start=True, active=active_per_round,
-            fused_preds=grid_fused_preds,
-        )
-        F_ep = color_frames.shape[0]
-        frames_per_round = transition_steps + 1
-        frame_round = [0] * (1 + transition_steps)
-        for k in range(R - 1):
-            frame_round += [k + 1] * frames_per_round
-        frame_round += [R]
-        frame_round = frame_round[:F_ep]
-        grid_imgs_ep = []
-        for f in range(F_ep):
-            grids = []
-            for s in range(nsamp):
-                grid = np.full((Hg, Wg, 3), 1.0)
-                for idx, (r, c) in enumerate(coords):
-                    gr, gc = int(r // stride), int(c // stride)
-                    grid[gr, gc] = color_frames[f, s, idx]
-                grids.append(grid)
-            grid_imgs_ep.append(grids)
-        ep_data.append({
-            "grid_imgs": grid_imgs_ep, "frame_round": frame_round, "R": R,
-            "images": ep["images"], "labels": ep["labels"],
-            "kinds": ep["sample_kinds"],
-            "row_labels": ep.get("row_labels"),               # condition names per row (robustness viz)
-            "fused_frames": fused_frames,           # (F_ep, B, C) fused scorecard per frame
-        })
+def _build_figure(nsamp, row_titles, has_abstract):
+    """Create the figure + artists for the confidence-grid GIF.
 
-    # --- flat frame sequence with linger between episodes ---
-    flat_frames = []
-    for ei, ed in enumerate(ep_data):
-        F_ep = len(ed["grid_imgs"])
-        for f in range(F_ep):
-            flat_frames.append((ei, f))
-        for _ in range(linger_frames):
-            flat_frames.append((ei, F_ep - 1))
+    Layout per row: [input digit | 2x5 confidence grid]. Each of the 10 cells
+    is a digit 0-9: blank if the model's softmax confidence for it is < 50%,
+    otherwise colored with that digit's label color, dim near 50% and bright
+    near 100%. The model's predicted digit (argmax) always gets a green border
+    so the decision is visible even when nothing crosses 50%.
+    """
+    n_panels = 2   # input | confidence grid
+    width_ratios = [1.0, 3.0]
+    fig = plt.figure(figsize=(9, 2.6 * nsamp + 0.6))
+    gs = fig.add_gridspec(nsamp, n_panels, width_ratios=width_ratios)
+    fig.subplots_adjust(left=0.04, right=0.98, top=0.92, bottom=0.04,
+                        wspace=0.12, hspace=0.30)
 
-    # --- figure: vertical layout ---
-    # 4 columns: [input digit | neuron grid | fused-scorecard bars | digit legend]
-    # The fused-scorecard bar chart shows the ACTUAL judging signal (mean of raw
-    # logits over active columns, then argmax). This is what makes the viz honest:
-    # viewers can see WHY the fused winner wins even when most cells' personal top
-    # pick (the grid color) differs. Without it, a "majority blue but fused=pink"
-    # result looks like a bug; with it, you see every cell contributing to slot 7.
-    fig = plt.figure(figsize=(8.6, 2.4 * nsamp + 0.6))
-    gs = fig.add_gridspec(nsamp, 4, width_ratios=[1, 2.0, 1.5, 0.32])
-    img_axes = [fig.add_subplot(gs[r, 0]) for r in range(nsamp)]
-    grid_axes = [fig.add_subplot(gs[r, 1]) for r in range(nsamp)]
-    bar_axes = [fig.add_subplot(gs[r, 2]) for r in range(nsamp)]
-    ax_legend = fig.add_subplot(gs[:, 3])
-    fig.subplots_adjust(left=0.04, right=0.97, top=0.93, bottom=0.03,
-                        wspace=0.18, hspace=0.30)
+    artists = {"fig": fig, "gs": gs, "has_abstract": has_abstract}
 
-    # shared x-limit for all bar charts (symmetric, from global max|fused|)
-    all_fused = np.concatenate(
-        [ed["fused_frames"].reshape(-1, 10) for ed in ep_data], axis=0
-    )
-    x_lim = float(np.abs(all_fused).max()) * 1.15 + 0.5
-
-    # legend (static)
-    ax_legend.set_xlim(0, 1); ax_legend.set_ylim(-0.5, 10.5)
-    ax_legend.set_xticks([]); ax_legend.set_yticks([])
-    ax_legend.set_title("digit", fontsize=10, pad=6)
-    for v in range(10):
-        ax_legend.add_patch(plt.Rectangle((0.1, v - 0.35), 0.25, 0.7, color=DIGIT_COLORS[v]))
-        ax_legend.text(0.45, v, str(v), va="center", fontsize=10)
-    ax_legend.invert_yaxis()
-
-    # grid imshow artists + white cell borders, one per row
-    grid_artists = []
+    # ── input digit axes ──
+    artists["img_axes"] = []
+    artists["img_ims"] = []
     for r in range(nsamp):
-        im = grid_axes[r].imshow(ep_data[0]["grid_imgs"][0][r], interpolation="nearest", vmin=0, vmax=1)
-        grid_axes[r].set_xticks([]); grid_axes[r].set_yticks([])
-        for gr in range(Hg):
-            for gc in range(Wg):
-                grid_axes[r].add_patch(plt.Rectangle(
-                    (gc - 0.5, gr - 0.5), 1, 1, fill=False, edgecolor="white", linewidth=1.2, zorder=2,
-                ))
-        grid_artists.append(im)
-    # header on the grid column (only once, on the first row)
-    grid_axes[0].set_title("Mini networks", fontsize=10, pad=4)
+        ax = fig.add_subplot(gs[r, 0])
+        im = ax.imshow(np.zeros((28, 28)), cmap="gray", vmin=0, vmax=1)
+        ax.set_xticks([]); ax.set_yticks([])
+        ax.set_title(row_titles[r], fontsize=11, pad=4)
+        artists["img_axes"].append(ax)
+        artists["img_ims"].append(im)
 
-    # input image artists
-    img_artists = []
+    # ── 2x5 confidence grid axes ──
+    artists["conf_axes"] = []
+    artists["conf_ims"] = []           # per-sample: imshow (2,5,3) background
+    artists["conf_pct_texts"] = []     # per-sample: 10 text (percentage in each cell)
+    artists["conf_winner_rects"] = []  # per-sample: green border on the argmax cell
     for r in range(nsamp):
-        im = img_axes[r].imshow(episodes[0]["images"][r], cmap="gray", vmin=0, vmax=1)
-        img_axes[r].set_xticks([]); img_axes[r].set_yticks([])
-        img_artists.append(im)
-
-    # fused-scorecard bar artists: 10 horizontal bars per sample (one per digit).
-    # Bar WIDTH is the fused score (updates every frame); bar COLOR is the digit
-    # color; the WINNER (argmax of fused) is drawn at full alpha with a black
-    # edge, the rest dimmed so the eye locks onto the consensus winner.
-    bar_artists = []   # list of lists of 10 barh patches, per sample row
-    for r in range(nsamp):
-        ax = bar_axes[r]
-        ax.set_xlim(-x_lim, x_lim)
-        ax.set_ylim(-0.6, 9.6)
-        ax.set_yticks(range(10))
-        ax.set_yticklabels([str(d) for d in range(10)], fontsize=8)
-        # labeled +/- horizontal axis: show negative, zero, positive so the
-        # viewer can see which bars are above/below zero (agreement vs dissent).
-        tick_vals = [-x_lim, 0.0, x_lim]
-        ax.set_xticks(tick_vals)
-        ax.set_xticklabels([f"\u2212{x_lim:.1f}", "0", f"+{x_lim:.1f}"], fontsize=7)
-        ax.tick_params(axis="x", length=2, pad=1)
-        # emphasize the zero line (the decision boundary: + = evidence for, \u2212 = against)
-        ax.axvline(0.0, color="0.35", linewidth=1.0, zorder=0)
-        if r == nsamp - 1:
-            ax.set_xlabel("fused logit  (\u2212  |  +)", fontsize=7, labelpad=1)
-        bars = []
+        ax = fig.add_subplot(gs[r, 1])
+        im = ax.imshow(np.zeros((2, 5, 3)), interpolation="nearest", vmin=0, vmax=1)
+        ax.set_xlim(-0.5, 4.5)
+        ax.set_ylim(1.5, -0.5)          # row 0 (digits 0-4) on top
+        ax.set_xticks([]); ax.set_yticks([])
+        # white cell borders (static) + static digit-number labels
         for d in range(10):
-            b = ax.barh(d, 0.0, color=DIGIT_COLORS[d], alpha=0.35,
-                        edgecolor="none", height=0.7, zorder=1)
-            bars.append(b)
-        bar_artists.append(bars)
-        if r == 0:
-            ax.set_title("Mini networks decision", fontsize=10, pad=4)
+            rr, cc = d // 5, d % 5
+            ax.add_patch(plt.Rectangle((cc - 0.5, rr - 0.5), 1, 1, fill=False,
+                                       edgecolor="white", linewidth=1.2, zorder=2))
+            ax.text(cc, rr, str(d), ha="center", va="center", fontsize=12,
+                    color="#71717a", fontweight="bold", zorder=3)
+        # percentage text per cell (updated each frame; blank if < 50%)
+        pct_texts = []
+        for d in range(10):
+            rr, cc = d // 5, d % 5
+            t = ax.text(cc, rr + 0.30, "", ha="center", va="center", fontsize=8,
+                        color="white", fontweight="bold", zorder=4)
+            pct_texts.append(t)
+        # green winner border (moved each frame to the argmax cell)
+        win_rect = mpatches.Rectangle((-0.5, -0.5), 1, 1, fill=False,
+                                      edgecolor="#16a34a", linewidth=3.0, zorder=5)
+        ax.add_patch(win_rect)
+        artists["conf_axes"].append(ax)
+        artists["conf_ims"].append(im)
+        artists["conf_pct_texts"].append(pct_texts)
+        artists["conf_winner_rects"].append(win_rect)
+    artists["conf_axes"][0].set_title(
+        "Decision confidence  (blank < 50%  \u00b7  color strength = confidence)",
+        fontsize=10, pad=6, color="#22d3ee")
 
-    # per-row input label. If the episode provides `row_labels` (e.g. condition
-    # names for the robustness viz), use them; otherwise default to the digit.
-    # Always show the correct/wrong tag so the user sees the verdict.
-    ed0 = ep_data[0]
-    def _row_title(ed, r):
-        if ed.get("row_labels") is not None:
-            head = str(ed["row_labels"][r])
-        else:
-            head = f"digit {int(ed['labels'][r])}"
-        kind = ed["kinds"][r]
-        tag = "\u2713" if kind == "correct" else "\u2717"
-        return f"{head}  {tag}"
-    for r in range(nsamp):
-        img_axes[r].set_title(_row_title(ed0, r), fontsize=10, pad=4)
+    return artists
 
-    cur_ep = [-1]
 
-    def draw(frame):
-        ei, fi = flat_frames[frame]
-        ed = ep_data[ei]
-        fused_f = ed["fused_frames"][fi]        # (B, C) fused scorecard this frame
-        for r in range(nsamp):
-            grid_artists[r].set_data(ed["grid_imgs"][fi][r])
-            # update the fused-scorecard bars for this sample
-            scores = fused_f[r]                  # (C,)
-            winner = int(scores.argmax())
-            for d in range(10):
-                bars_d = bar_artists[r][d]
-                # barh width = score; redraw by setting the rectangle width
-                for patch in bars_d:
-                    patch.set_width(scores[d])
-                is_winner = (d == winner)
-                for patch in bars_d:
-                    patch.set_alpha(1.0 if is_winner else 0.30)
-                    patch.set_edgecolor("black" if is_winner else "none")
-                    patch.set_linewidth(1.2 if is_winner else 0.0)
-        if ei != cur_ep[0]:
-            cur_ep[0] = ei
-            for r in range(nsamp):
-                img_artists[r].set_data(ed["images"][r])
-                img_axes[r].set_title(_row_title(ed, r), fontsize=10, pad=4)
-        k = ed["frame_round"][fi] if fi < len(ed["frame_round"]) else ed["R"]
-        R = ed["R"]
-        label = "round 0 (init)" if k == 0 else f"round {k}/{R}"
-        ep_label = f"  |  batch {ei + 1}/{len(episodes)}" if len(episodes) > 1 else ""
-        fig.suptitle(f"Adaptive Consensus Networks  \u2014  {label}{ep_label}", fontsize=13)
-        return grid_artists
+def _draw_round(artists, snap, images_np, labels_np, round_idx, n_rounds,
+                row_titles):
+    """Update all artists for one animation frame (one consensus round).
 
-    anim = matplotlib.animation.FuncAnimation(
-        fig, draw, frames=len(flat_frames), repeat=True, interval=duration_ms, blit=False,
-    )
+    Each sample: input digit + the 2x5 confidence grid for the model's readout
+    at THIS round (softmax of the confidence-weighted fused readout). As
+    consensus proceeds, a digit crosses 50% and its cell brightens.
+    """
+    nsamp = len(images_np)
+    for s in range(nsamp):
+        artists["img_ims"][s].set_data(images_np[s])
+
+        # the model's real (confidence-weighted) readout at this round -> softmax
+        vd = _weighted_vote_data(snap, s, round_idx)
+        probs = _softmax_np(vd["fused"])                  # (10,)
+        grid = _confidence_grid_rgb(probs)                # (2, 5, 3)
+        artists["conf_ims"][s].set_data(grid)
+
+        # percentage text in each lit cell (>= 50%); blank otherwise
+        for d in range(10):
+            p = float(probs[d])
+            artists["conf_pct_texts"][s][d].set_text(f"{p:.0%}" if p >= 0.5 else "")
+        # green border on the model's predicted digit (argmax), always visible
+        w = vd["winner"]
+        wr, wc = w // 5, w % 5
+        artists["conf_winner_rects"][s].set_xy((wc - 0.5, wr - 0.5))
+
+    r = min(round_idx + 1, n_rounds)
+    artists["fig"].suptitle(
+        f"ACN \u2014 Decision Confidence  |  Round {r}/{n_rounds}",
+        fontsize=13, color="#22d3ee")
+
+
+# ════════════════════════════════════════════════════════════════════
+# Batched GIF rendering (4 samples per batch so the 3-stack weighted-vote
+# panel has enough vertical room — no y-axis overlap)
+# ════════════════════════════════════════════════════════════════════
+
+def _render_batch_frames(model, batch_imgs, batch_labels, row_title_fn,
+                          linger_frames, suptitle_fn):
+    """Render one batch (≤4 samples) to a list of PIL.Image frames.
+
+    Each frame is one consensus round; `linger_frames` copies of the final
+    frame are appended so the batch holds on its converged state.
+
+    `row_title_fn(local_idx, pred_class, batch_label) -> str` builds each row's
+    title from the PER-BATCH snapshot's prediction, so the ✓/✗ tag always
+    matches the grid's winner (the gate is stochastic, so the tag must come
+    from the same snapshot as the grid).
+    """
+    dev = next(model.parameters()).device
+    batch_imgs = batch_imgs.to(dev)
+    snap = V3Snapshot(model, batch_imgs, record=True)
+    nsamp = len(batch_imgs)
+    images_np = batch_imgs.cpu().numpy().squeeze()
+    labels_np = batch_labels.cpu().numpy() if torch.is_tensor(batch_labels) \
+        else np.asarray(batch_labels)
+    if images_np.ndim == 2:               # single sample -> add a dim
+        images_np = images_np[None]
+
+    # row titles from THIS batch's snapshot (tag consistent with the grid)
+    row_titles = [row_title_fn(j, int(snap.pred_class[j]), int(labels_np[j]))
+                  for j in range(nsamp)]
+
+    n_rounds = len(snap.bottom_choices_round) if snap.bottom_choices_round is not None else 1
+    artists = _build_figure(nsamp, row_titles, snap.has_abstract)
+
+    frames = []
+    for k in range(n_rounds):
+        _draw_round(artists, snap, images_np, labels_np, k, n_rounds, row_titles)
+        artists["fig"].suptitle(suptitle_fn(k, n_rounds), fontsize=13, color="#22d3ee")
+        artists["fig"].canvas.draw()
+        w, h = artists["fig"].canvas.get_width_height()
+        buf = artists["fig"].canvas.buffer_rgba()
+        frames.append(Image.frombytes("RGBA", (w, h), bytes(buf)).convert("RGB"))
+    for _ in range(linger_frames):
+        frames.append(frames[-1].copy())
+    plt.close(artists["fig"])
+    return frames
+
+
+def _save_frames_as_gif(frames, path, duration_ms):
+    """Save a list of PIL.Image frames to a play-once GIF (loop=1)."""
     Path(path).parent.mkdir(parents=True, exist_ok=True)
-    writer = PillowWriter(fps=int(1000 / duration_ms))
-    anim.save(path, writer=writer)
-    plt.close(fig)
+    frames[0].save(
+        str(path), save_all=True, append_images=frames[1:],
+        duration=duration_ms, loop=1)
+# ════════════════════════════════════════════════════════════════════
+# Main GIF builder: per-digit spotlight
+# ════════════════════════════════════════════════════════════════════
+
+def make_spotlight_gif(
+    model,
+    images: torch.Tensor,
+    labels: torch.Tensor,
+    path: str | Path = "spotlight.gif",
+    n_samples: int = 10,
+    duration_ms: int = 200,
+    linger_frames: int = 15,
+    batch_size: int = 4,
+) -> None:
+    """Create the Thousand-Brains Grid GIF (one row per digit class), BATCHED.
+
+    Samples are split into batches of `batch_size` (default 4) so each batch
+    figure has only 4 rows — giving the 3-stack weighted-vote panel enough
+    vertical room (no y-axis label overlap). The GIF plays batch 1 → linger →
+    batch 2 → linger → ... then holds on the last batch's final frame (loop=1).
+
+    Each row: input digit | bottom grid (confidence-dimmed) | top grid |
+    weighted vote (top + bottom → fused, with confidence gauges).
+    """
+    # pick one sample per digit class if possible
+    labels_np_all = labels.cpu().numpy()
+    sample_indices = []
+    for d in range(10):
+        idxs = np.where(labels_np_all == d)[0]
+        if len(idxs) > 0:
+            sample_indices.append(int(idxs[0]))
+        if len(sample_indices) >= n_samples:
+            break
+    if len(sample_indices) < n_samples:
+        remaining = [i for i in range(len(labels_np_all)) if i not in sample_indices]
+        sample_indices.extend(remaining[:n_samples - len(sample_indices)])
+    sample_indices = sample_indices[:n_samples]
+
+    dev = next(model.parameters()).device
+    all_imgs = images[sample_indices].to(dev)
+    all_labels = labels[sample_indices]
+
+    # reproducible gate
+    torch.manual_seed(42)
+
+    # split into batches of `batch_size`
+    batches = [sample_indices[i:i + batch_size] for i in range(0, len(sample_indices), batch_size)]
+    n_batches = len(batches)
+
+    def row_title_fn(j, pred, lbl):
+        tag = "\u2713" if pred == lbl else "\u2717"
+        return f"digit {lbl}  {tag}"
+
+    all_frames = []
+    for bi, idxs in enumerate(batches):
+        batch_imgs = images[idxs]
+        batch_labels = labels[idxs]
+
+        def suptitle(k, R, _bi=bi):
+            return (f"ACN \u2014 Decision Confidence  |  "
+                    f"batch {_bi + 1}/{n_batches}  |  Round {min(k + 1, R)}/{R}")
+        frames = _render_batch_frames(
+            model, batch_imgs, batch_labels, row_title_fn,
+            linger_frames, suptitle)
+        all_frames.extend(frames)
+
+    _save_frames_as_gif(all_frames, path, duration_ms)
+    print(f"Spotlight GIF saved: {path}  ({n_batches} batches × ≤{batch_size} samples, "
+          f"{len(all_frames)} frames)")
 
 
+# ════════════════════════════════════════════════════════════════════
+# Robustness Spotlight: one digit under 7 corruptions
+# ════════════════════════════════════════════════════════════════════
+
+def rotate_batch(X, degrees):
+    n = len(X)
+    ang = torch.empty(n, device=X.device).uniform_(-degrees, degrees)
+    theta = torch.zeros(n, 2, 3, device=X.device)
+    rad = ang * (np.pi / 180.0)
+    theta[:, 0, 0] = torch.cos(rad); theta[:, 0, 1] = -torch.sin(rad)
+    theta[:, 1, 0] = torch.sin(rad); theta[:, 1, 1] = torch.cos(rad)
+    grid = F.affine_grid(theta, X.shape, align_corners=False)
+    return F.grid_sample(X, grid, align_corners=False, padding_mode="zeros")
+
+
+def occlude_batch(X, n_boxes=3, box_size=7):
+    out = X.clone()
+    H, W = X.shape[-2], X.shape[-1]
+    for _ in range(n_boxes):
+        r = torch.randint(0, H - box_size + 1, (len(X),), device=X.device)
+        c = torch.randint(0, W - box_size + 1, (len(X),), device=X.device)
+        for b in range(len(X)):
+            out[b, :, r[b]:r[b]+box_size, c[b]:c[b]+box_size] = 0.0
+    return out
+
+
+def noise_batch(X, sigma=0.3):
+    return (X + sigma * torch.randn_like(X)).clamp(0, 1)
+
+
+def shift_batch(X, frac=0.2):
+    n = len(X)
+    theta = torch.zeros(n, 2, 3, device=X.device)
+    theta[:, 0, 0] = 1.0; theta[:, 1, 1] = 1.0
+    theta[:, 0, 2] = torch.empty(n, device=X.device).uniform_(-frac, frac)
+    theta[:, 1, 2] = torch.empty(n, device=X.device).uniform_(-frac, frac)
+    grid = F.affine_grid(theta, X.shape, align_corners=False)
+    return F.grid_sample(X, grid, align_corners=False, padding_mode="zeros")
+
+
+def make_robustness_spotlight_gif(
+    model,
+    images: torch.Tensor,
+    labels: torch.Tensor,
+    path: str | Path = "robustness_spotlight.gif",
+    sample_idx: int = 0,
+    duration_ms: int = 250,
+    linger_frames: int = 20,
+    batch_size: int = 4,
+) -> None:
+    """Create the Robustness Grid GIF: one digit under 8 corruptions, BATCHED.
+
+    8 conditions (clean + 7 corruptions) split into 2 batches of 4 so each
+    batch figure has only 4 rows (the 3-stack weighted-vote panel gets enough
+    vertical room). The GIF plays batch 1 (rotations) → linger → batch 2
+    (shifts/occlude/noise) → linger, then holds (loop=1).
+    """
+    dev = next(model.parameters()).device
+    img = images[sample_idx:sample_idx+1].to(dev)
+    label = int(labels[sample_idx])
+
+    torch.manual_seed(42)
+    conditions = [
+        ("clean",   img),
+        ("rot15",   rotate_batch(img, 15)),
+        ("rot30",   rotate_batch(img, 30)),
+        ("rot45",   rotate_batch(img, 45)),
+        ("shift20", shift_batch(img, 0.2)),
+        ("shift30", shift_batch(img, 0.3)),
+        ("occ3×7",  occlude_batch(img, 3, 7)),
+        ("noise30", noise_batch(img, 0.3)),
+    ]
+    cond_names = [c[0] for c in conditions]
+    all_imgs = torch.cat([c[1] for c in conditions], dim=0)   # (8, 1, 28, 28)
+    all_labels = torch.full((len(conditions),), label, dtype=torch.long)
+
+    # reproducible gate
+    torch.manual_seed(42)
+
+    # split the 8 conditions into batches of `batch_size`
+    n = len(conditions)
+    batches = [list(range(i, min(i + batch_size, n))) for i in range(0, n, batch_size)]
+    n_batches = len(batches)
+
+    all_frames = []
+    for bi, idxs in enumerate(batches):
+        batch_imgs = all_imgs[idxs]
+        batch_labels = all_labels[idxs]
+        cond_names_batch = [cond_names[ci] for ci in idxs]
+
+        def _rtf(j, pred, lbl, _names=cond_names_batch):
+            tag = "\u2713" if pred == lbl else "\u2717"
+            return f"{_names[j]}  {tag}"
+
+        def suptitle(k, R, _bi=bi):
+            return (f"ACN — Robustness Confidence  |  GT: {label}  |  "
+                    f"batch {_bi + 1}/{n_batches}  |  Round {min(k + 1, R)}/{R}")
+        frames = _render_batch_frames(
+            model, batch_imgs, batch_labels, _rtf,
+            linger_frames, suptitle)
+        all_frames.extend(frames)
+
+    _save_frames_as_gif(all_frames, path, duration_ms)
+    print(f"Robustness Grid GIF saved: {path}  ({n_batches} batches × ≤{batch_size}, "
+          f"{len(all_frames)} frames)")

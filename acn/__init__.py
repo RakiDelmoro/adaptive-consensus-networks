@@ -1,4 +1,4 @@
-"""Adaptive Consensus Networks (ACN)."""
+"""Adaptive Consensus Networks (Thousand-Brains Reference Frame)."""
 
 from acn.config import (
     DataConfig,

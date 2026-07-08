@@ -2,91 +2,81 @@
 
 A Thousand-Brains-style sparse-column architecture: an image is split into
 overlapping patches, each patch gets its own mini network (a "column"), and a
-**sparse subset of columns activates per input**. The active columns run an ADMM
-consensus loop, converge to one shared answer, and vote. The rest stay silent.
+**sparse subset of columns activates per input**. The active columns run an
+ADMM consensus loop, converge to one shared answer, and vote.
 
 ## What is ACN?
 
 Instead of one big network swallowing the whole image, **ACN chops the image into
-overlapping patches and gives each patch its own tiny network** (a "mini network"
-or "column"). No single column sees enough to classify the image alone — they
-have to **talk**.
+overlapping multi-scale patches and gives each patch its own tiny network** (a
+"mini network" or "column"). No single column sees enough to classify the image
+alone — they have to **talk**.
 
-The talking is an ADMM consensus loop: each active column proposes a local answer
-(`x`), negotiates a shared agreement with neighbors (`z`), and remembers how much
-it had to compromise (`u`). After K rounds, the active columns' answers line up
-and are fused into one prediction (only active columns vote — the
-Thousand-Brains sparse vote).
+The talking is a **unified hierarchy loop**: the bottom layer (74 patch-columns)
+and the top layer (8 abstract columns) step together for 20 rounds. Each round:
+1. Bottom columns do one ADMM consensus step (all-pairs — active columns talk to
+   each other wherever they are).
+2. The top layer reads the bottom's current belief and does its own consensus step.
+3. A **predictive-coding exchange** sends predictions down and errors up — both
+   layers adjust each other (biologically plausible, like cortical feedback loops).
 
-The adaptive part is **which columns fire** — a **learned gate**. The encoder
-outputs a per-column relevance logit `s_i`; the gate is `sigmoid(s_i)`. The
-active count is **discovered by training** under a gentle sparsity penalty —
-a "1" recruits few columns, an "8" recruits many. Brain-like ~10% active.
-
-The relevance head is bias-init high so gates start near 1 (all columns active);
-the sparsity penalty then prunes the useless columns DOWN over training, instead
-of starting at ~0.5 and sliding to 0 (the gate-collapse failure mode fixed in
-LOG_2026-07-05).
-
-A secondary Physarum-style conductance dynamics on the wires (`D_ij`) grows links
-where neighbors keep disagreeing and prunes them where they agree, masked by
-column activity so silent columns carry no flow.
-
-Each column and every link exposes inspectable state (`x`, `z`, `u`, `D`,
-disagreement flux `Q`, the gate `active`), so you can watch *which columns fired,
-how hard they coordinated, and which wires survived* — per input, per digit class.
-
-**In one sentence:** many small patch-networks negotiate a shared answer through
-ADMM, a sparse subset activates per input, and they vote — so the model is a
-diverse ensemble that softly agrees, robust under distribution shift.
+The **verdict** is a **cooperative confidence-weighted vote**: both layers
+contribute, weighted by how confident each is on that input. A clean digit → the
+top's gestalt leads. A noisy tie → the bottom's per-patch detail leads.
 
 ## Quick start
 
 ```bash
 pip install -e .
 pytest -q
-python train.py                       # full training (50 epochs) + consensus GIF
-python train.py train.epochs=3        # quick tweak via dotted overrides
+python train.py mnist                      # full training (50 epochs) + GIFs
+python train.py mnist train.epochs=3       # quick tweak via dotted overrides
 ```
 
-Training writes checkpoints + a consensus-agreement GIF to `results/runs/model_result/`.
+Training writes checkpoints + metrics to `results/runs/acn_result/`.
 
-The GIF shows, per sample: the input digit | the **Mini networks** grid (all
-active cells colored by the fused global decision; inactive cells black) | the
-**Mini networks decision** bar chart (the soft fused scorecard with a +/- axis,
-winner highlighted) | a digit color legend. The per-row label shows only the
-ground-truth digit — compare the winning color to the legend to judge
-correct/wrong.
-
-## Inspecting one sample
+## Visualizing
 
 ```bash
-python scripts/inspect_one_sample.py   # dump raw per-column scorecards for sample 6741
+python scripts/viz_spotlight.py            # generates spotlight.gif + robustness_spotlight.gif
 ```
 
-Loads the checkpoint, runs one forward pass, and prints the per-column raw
-logits, the gate, the fused scorecard, and the per-column argmax colors — so you
-can see exactly how the fused argmax wins. Edit the script to point at other
-samples.
+The GIFs show a **2×5 decision confidence grid**: each cell is a digit (0-9),
+blank if the model's confidence is < 50%, colored with brightness = confidence.
+Watch the decision form as the consensus rounds animate.
 
 ## Package layout
 
 ```
 acn/
-  config.py          # dataclasses + presets (poc test config, model_result)
-  decomposition.py   # overlapping patch extraction (batched)
-  topology.py        # spatial-neighbor edges + conductance init
-  consensus.py       # primal/consensus/dual + Physarum flux conductance (numpy ref + torch)
-  networks.py        # encoder (+relevance head), decoder, restriction maps, sparse_fuse, column_gate
-  model.py           # AdaptiveConsensusNetwork nn.Module (gate -> consensus -> sparse fuse)
-  train.py           # training loop, loss (CE + local + wire-sparse + gate-sparse), logging
-  inspect.py         # serialize x,z,u,D,Q,active + summary stats
-  visualize.py       # consensus GIF (grid + fused-decision bars)
-tests/               # parity, gradcheck, shapes, math unit tests
+  config.py          # dataclasses + presets (mnist, poc)
+  decomposition.py   # overlapping multi-scale patch extraction
+  topology.py        # all-pairs edges + conductance init
+  consensus.py       # ADMM primal/consensus/dual + motor + hierarchy loop
+  networks.py        # encoder (+positional), decoder, motor, predictive maps, gate
+  model.py           # AdaptiveConsensusNetwork nn.Module
+  train.py           # BPTT training loop, loss, logging
+  inspect.py         # serialize state + summary stats
+  visualize.py       # 2×5 confidence grid GIFs
+tests/
+  test_smoke.py      # forward, backprop, shapes, presets
 scripts/
-  viz_consensus.py        # generate the consensus GIF from a checkpoint
-  inspect_one_sample.py   # dump raw per-column scorecards for one sample
+  viz_spotlight.py        # generate the confidence GIFs from a checkpoint
+  eval_robustness.py      # evaluate under corruptions
 ```
 
-See `BLUEPRINT.md` for the full architecture and `LOG_2026-07-05.md` for the
-sparse-column migration and the learned-gate collapse/fix.
+## Architecture (145,714 parameters)
+
+- **Bottom layer**: 74 multi-scale columns (4×4, 6×6, 8×8 patches), 8 active per
+  input (hard top-k gate), latent dim 32, all-pairs topology.
+- **Top layer**: 8 abstract columns, 4 active per input, latent dim 16, all-pairs.
+- **Hierarchy**: 20 rounds, BPTT with detach_after=8, predictive-coding exchange
+  (decode_down + encode_up, separate learned maps).
+- **Readout**: cooperative confidence-weighted vote (logit-margin weights).
+- **Motor system**: 2D path integration + efference copy.
+- **Warm start**: feedforward sweep (each column's own primal, no primer/broadcast).
+
+## Results
+
+- **MNIST test accuracy: ~95%** with 145K params (LeNet-scale, sparse-column
+  consensus hierarchy instead of conv stack).

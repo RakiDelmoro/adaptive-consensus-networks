@@ -1,23 +1,4 @@
-"""ACN consensus core: primal / consensus / dual updates + Physarum conductance.
-
-Two implementations live here:
-
-* :func:`numpy_consensus_step` and friends — a deliberately simple NumPy reference
-  matching the spec pseudocode exactly. Used by tests to validate the torch path.
-* :class:`ACNCore` — the batched, differentiable torch implementation that the model
-  backprops through for all K rounds.
-
-Math (per mini network i, edge (i,j)):
-
-  Primal:      x_i = (A_i + rho I)^{-1} (b_i + rho (z_i - u_i))
-  Flux:        q_ij = || F_ij z_i - F_ji z_j ||^2
-  Conductance: D_ij = clip( D_ij + eta_D * q/(1+q) - gamma_D * D_ij, 0, D_clip )
-  Consensus:   z_i -= eta_z * sum_j D_ij * F_ij^T (F_ij z_i - F_ji z_j)
-  Dual:        u_i += x_i - z_i
-
-Restriction maps are diagonal: F_ij = diag(r_ij), symmetric (r_ij = r_ji),
-realizing the "shared channel" interpretation.
-"""
+"""ACN consensus core: primal / consensus / dual + motor / path integration / primer."""
 
 from __future__ import annotations
 
@@ -25,115 +6,25 @@ from dataclasses import dataclass
 
 import numpy as np
 import torch
-
-# ===================================================================== #
-# NumPy reference
-# ===================================================================== #
+import torch.nn as nn
+import torch.nn.functional as F
 
 
-def _np_lower_tri(flat: np.ndarray, d: int) -> np.ndarray:
-    """Build a (d, d) lower-triangular matrix from d*(d+1)/2 flat params."""
-    L = np.zeros((d, d))
-    idx = np.tril_indices(d)
-    L[idx] = flat
-    return L
-
-
-def numpy_consensus_step(
-    A: np.ndarray,        # (N, d, d)
-    b: np.ndarray,        # (N, d)
-    r_ij: np.ndarray,     # (E, d) restriction for direction i->j
-    r_ji: np.ndarray,     # (E, d) restriction for direction j->i
-    edges: np.ndarray,    # (E, 2)
-    x: np.ndarray,        # (N, d)
-    z: np.ndarray,        # (N, d)
-    u: np.ndarray,        # (N, d)
-    D: np.ndarray,        # (E,)
-    rho: float,
-    eta_z: float,
-    eta_D: float,
-    gamma_D: float,
-    D_clip: float,
-    diffusion_steps: int = 1,
-):
-    """One ADMM round (primal + T diffusion+conductance steps + dual), NumPy.
-
-    The consensus update is a gradient step on
-        (rho/2) ||x_i - z_i + u_i||^2  +  (1/2) sum_ij D_ij ||F_ij z_i - F_ji z_j||^2
-    i.e. the standard ADMM consensus pull toward (x_i + u_i) *plus* pairwise
-    disagreement smoothing. The pull term is required: without it z=0 (or any
-    constant) is a fixed point of pure diffusion and the decoder sees nothing.
-    """
-    N, d = A.shape[:2]
-    I = np.eye(d)
-    # --- primal ---
-    for i in range(N):
-        M = A[i] + rho * I
-        rhs = b[i] + rho * (z[i] - u[i])
-        x[i] = np.linalg.solve(M, rhs)
-
-    Q = np.zeros(edges.shape[0])
-    # === Option A: measure disagreement on RAW proposals x (before consensus) ===
-    if edges.shape[0] > 0:
-        ei, ej = edges[:, 0], edges[:, 1]
-        diff_x = r_ij * x[ei] - r_ji * x[ej]      # (E, d) flux on raw proposals
-        Q = (diff_x ** 2).sum(-1)                  # (E,)
-        q_max = Q.max() + 1e-8 if Q.size > 0 else 1.0
-        phi = Q / q_max                            # relative feedback (max-normalized, matches torch)
-        D = np.clip(D + eta_D * phi - gamma_D * D, 0.0, D_clip) if Q.size > 0 else D
-
-    for _ in range(diffusion_steps):
-        # consensus update (flows through the just-updated D)
-        ei, ej = edges[:, 0], edges[:, 1]
-        diff = r_ij * z[ei] - r_ji * z[ej]          # (E, d) flux on consensus state
-        z_new = z.copy()
-        for i in range(N):
-            z_new[i] = z_new[i] + eta_z * rho * (x[i] + u[i] - z_new[i])
-        for e, (i, j) in enumerate(edges):
-            grad_i = D[e] * (r_ij[e] * diff[e])      # F_ij^T (F_ij z_i - F_ji z_j)
-            z_new[i] = z_new[i] - eta_z * grad_i
-            grad_j = D[e] * (r_ji[e] * (-diff[e]))   # F_ji^T (F_ji z_j - F_ij z_i)
-            z_new[j] = z_new[j] - eta_z * grad_j
-        z = z_new
-
-    # --- dual ---
-    u = u + (x - z)
-    return x, z, u, D, Q
-
-
-# ===================================================================== #
-# Torch core
-# ===================================================================== #
+from acn.networks import MotorSystem
 
 
 @dataclass
 class ConsensusState:
-    """Tensors carried across consensus rounds (batched).
-
-    All have a leading batch dim B (except D which is per-sample per-edge).
-
-    x, z, u: (B, N, d)
-    D:      (B, E)
-    Q:      (B, E) flux of the last diffusion step
-    history: list of dicts (one per round) with x/z/u/D/Q snapshots (if record=True)
-    """
-
     x: torch.Tensor
     z: torch.Tensor
     u: torch.Tensor
     D: torch.Tensor
     Q: torch.Tensor
     history: list[dict] | None = None
-    # per-node logits (B, N, C); set by the model after decoding z
     logits: torch.Tensor | None = None
-    # per-column activation gate (B, N) in [0,1]. Set by the model from the
-    # learned column_gate(); inactive columns (~0) stay silent in consensus and
-    # are excluded from fusion.
     active: torch.Tensor | None = None
-    # per-column relevance logits (B, N) from the encoder, used by the gate
-    # (active = sigmoid(relevance_logits)) and by the z-loss regularizer in the
-    # training loss (keeps the gate's logits bounded so it can't saturate).
     relevance_logits: torch.Tensor | None = None
+    motor: torch.Tensor | None = None
 
 
 def make_state(
@@ -141,8 +32,12 @@ def make_state(
     device: torch.device | str,
     dtype: torch.dtype,
     D_init: torch.Tensor | None = None,
+    z_init: torch.Tensor | None = None,
 ) -> ConsensusState:
-    z = torch.zeros(B, N, d, device=device, dtype=dtype)
+    if z_init is not None:
+        z = z_init.to(device=device, dtype=dtype).clone()
+    else:
+        z = torch.zeros(B, N, d, device=device, dtype=dtype)
     x = torch.zeros_like(z)
     u = torch.zeros_like(z)
     if D_init is None:
@@ -151,90 +46,75 @@ def make_state(
         D = D_init.to(device=device, dtype=dtype).expand(B, -1).clone()
     Q = torch.zeros(B, E, device=device, dtype=dtype)
     return ConsensusState(x=x, z=z, u=u, D=D, Q=Q)
-
-
 class ACNCore:
-    """Batched, differentiable consensus loop.
-
-    Stateless helper object; holds no parameters. The model supplies A, b, r, edges.
-    """
-
     @staticmethod
     def primal(
-        A: torch.Tensor,    # (B, N, d, d)
-        b: torch.Tensor,    # (B, N, d)
-        z: torch.Tensor,    # (B, N, d)
-        u: torch.Tensor,    # (B, N, d)
-        rho: float,
+        A: torch.Tensor, b: torch.Tensor, z: torch.Tensor, u: torch.Tensor, rho: float
     ) -> torch.Tensor:
-        """x_i = (A_i + rho I)^{-1} (b_i + rho (z_i - u_i))."""
+        """x_i = (A_i + rho I)^{-1} (b_i + rho (z_i - u_i)).
+
+        Uses Cholesky + triangular solve instead of MagMA batched LU to avoid
+        illegal memory access on large batch sizes (> 8k). Chunked forward so
+        autograd backprop is also chunked.
+        """
         B, N, d, _ = A.shape
         I = torch.eye(d, device=A.device, dtype=A.dtype)
-        M = A + rho * I                              # (B, N, d, d)
-        rhs = b + rho * (z - u)                       # (B, N, d)
-        x = torch.linalg.solve(M, rhs.unsqueeze(-1)).squeeze(-1)
-        return x
+        M = A + rho * I
+        rhs = b + rho * (z - u)
+
+        # Flatten B,N so we have a single batch of B*N matrices
+        M_f = M.reshape(B * N, d, d)
+        rhs_f = rhs.reshape(B * N, d, 1)
+        chunk_size = 2048  # MagMA safe limit for this kernel
+        B_total = M_f.shape[0]
+
+        if B_total <= chunk_size:
+            L = torch.linalg.cholesky(M_f)
+            y = torch.linalg.solve_triangular(L, rhs_f, upper=False)
+            x = torch.linalg.solve_triangular(
+                L.transpose(-1, -2), y, upper=True
+            )
+            return x.squeeze(-1).reshape(B, N, d)
+
+        x_parts = []
+        for i in range(0, B_total, chunk_size):
+            end = min(i + chunk_size, B_total)
+            L_chunk = torch.linalg.cholesky(M_f[i:end])
+            y_chunk = torch.linalg.solve_triangular(L_chunk, rhs_f[i:end], upper=False)
+            x_chunk = torch.linalg.solve_triangular(
+                L_chunk.transpose(-1, -2), y_chunk, upper=True
+            )
+            x_parts.append(x_chunk)
+        x = torch.cat(x_parts, dim=0)
+        return x.squeeze(-1).reshape(B, N, d)
 
     @staticmethod
     def flux(
-        z: torch.Tensor,      # (B, N, d)
-        r_ij: torch.Tensor,   # (E, d) or (B, E, d)
-        r_ji: torch.Tensor,   # (E, d) or (B, E, d)
-        ei: torch.Tensor,     # (E,) long
-        ej: torch.Tensor,     # (E,) long
+        z: torch.Tensor, r_ij: torch.Tensor, r_ji: torch.Tensor,
+        ei: torch.Tensor, ej: torch.Tensor,
     ) -> torch.Tensor:
-        """Per-edge F_ij z_i - F_ji z_j, shape (B, E, d)."""
-        z_ei = z[:, ei]                              # (B, E, d)
-        z_ej = z[:, ej]                              # (B, E, d)
+        z_ei = z[:, ei]
+        z_ej = z[:, ej]
         if r_ij.dim() == 2:
-            r_ij = r_ij.unsqueeze(0)                 # (1, E, d)
+            r_ij = r_ij.unsqueeze(0)
             r_ji = r_ji.unsqueeze(0)
-        diff = r_ij * z_ei - r_ji * z_ej             # (B, E, d)
+        diff = r_ij * z_ei - r_ji * z_ej
         return diff
 
     @staticmethod
-    def conductance_update(
-        D: torch.Tensor,     # (B, E)
-        Q: torch.Tensor,     # (B, E)
-        eta_D: float | torch.Tensor,
-        gamma_D: float | torch.Tensor,
-        D_clip: float,
-    ) -> torch.Tensor:
-        """Physarum rule on detached flux (D is dynamics, not backprop).
-
-        Growth signal phi = Q / Q_max (RELATIVE, max-normalized per batch): the
-        strongest link gets phi=1, the weakest gets phi<<1, so the full range of
-        Q is preserved and weak links actually drop toward zero. eps guards
-        division (and the no-edge case).
-        """
-        Qd = Q.detach()
-        Q_max = Qd.amax(dim=1, keepdim=True)
-        Q_max = torch.where(torch.isfinite(Q_max) & (Q_max > 0), Q_max,
-                            torch.ones_like(Q_max)) + 1e-8
-        phi = Qd / Q_max
-        D = D + eta_D * phi - gamma_D * D
-        return D.clamp(0.0, D_clip)
-
-    @staticmethod
     def consensus_step(
-        z: torch.Tensor,     # (B, N, d)
-        x: torch.Tensor,     # (B, N, d)
-        u: torch.Tensor,     # (B, N, d)
-        r_ij: torch.Tensor,  # (E, d)
-        r_ji: torch.Tensor,  # (E, d)
-        D: torch.Tensor,     # (B, E)
-        ei: torch.Tensor, ej: torch.Tensor,
-        eta_z: float,
-        rho: float,
+        z: torch.Tensor, x: torch.Tensor, u: torch.Tensor,
+        r_ij: torch.Tensor, r_ji: torch.Tensor,
+        D: torch.Tensor, ei: torch.Tensor, ej: torch.Tensor,
+        eta_z: float, rho: float,
     ) -> torch.Tensor:
-        """z_i <- z_i + eta_z * (rho (x_i + u_i - z_i) - sum_j D_ij F_ij^T(...))."""
-        diff = ACNCore.flux(z, r_ij, r_ji, ei, ej)   # (B, E, d)
+        diff = ACNCore.flux(z, r_ij, r_ji, ei, ej)
         if r_ij.dim() == 2:
             r_ij_b = r_ij.unsqueeze(0)
             r_ji_b = r_ji.unsqueeze(0)
         else:
             r_ij_b, r_ji_b = r_ij, r_ji
-        grad_i = D.unsqueeze(-1) * (r_ij_b * diff)    # (B, E, d)  F_ij^T(...)
+        grad_i = D.unsqueeze(-1) * (r_ij_b * diff)
         grad_j = D.unsqueeze(-1) * (r_ji_b * (-diff))
         disagreement = torch.zeros_like(z)
         disagreement.index_add_(1, ei, grad_i)
@@ -246,25 +126,18 @@ class ACNCore:
     def run(
         A: torch.Tensor, b: torch.Tensor,
         r_ij: torch.Tensor, r_ji: torch.Tensor,
-        edges: torch.Tensor,        # (2, E) or (E, 2)
-        D_init: torch.Tensor,       # (E,) initial conductance per edge
+        edges: torch.Tensor, D_init: torch.Tensor,
         num_nodes: int,
         *,
         rounds: int,
         diffusion_steps: int,
         rho: float, eta_z: float,
-        eta_D, gamma_D, D_clip: float,
         record: bool = False,
         detach_after: int | None = None,
-        active: torch.Tensor,   # (B, N) in [0,1] — sparse column gate (always provided)
+        active: torch.Tensor,
+        motor_system: MotorSystem | None = None,
+        z_init: torch.Tensor | None = None,
     ) -> ConsensusState:
-        """Run K ADMM rounds. Returns final ConsensusState (+history if record).
-
-        `active` (B, N) gates columns: inactive columns (active≈0) do not
-        propose (x=0), are not pulled by neighbors (z stays 0, edges to/from
-        them carry no flow), and do not update their dual. This is the
-        Thousand-Brains sparse-column mechanism.
-        """
         if edges.dim() == 2 and edges.shape[0] == 2:
             ei, ej = edges[0], edges[1]
         elif edges.dim() == 2 and edges.shape[1] == 2:
@@ -274,46 +147,56 @@ class ACNCore:
 
         B, N, d = b.shape
         device, dtype = b.device, b.dtype
-        state = make_state(B, N, edges.shape[-1], d, device, dtype, D_init=D_init)
+        state = make_state(B, N, edges.shape[-1], d, device, dtype, D_init=D_init, z_init=z_init)
         state.active = active
         history: list[dict] | None = [] if record else None
 
-        # column mask: (B, N) -> broadcast to (B, N, 1) for state gating
-        col_mask = active.unsqueeze(-1)   # (B, N, 1)
-        # edge mask: an edge carries flow only if BOTH endpoints are active
-        edge_mask = active[:, ei] * active[:, ej]    # (B, E)
+        col_mask = active.unsqueeze(-1)        # (B, N, 1)
+        edge_mask = active[:, ei] * active[:, ej]  # (B, E)
+        state.D = state.D * edge_mask
 
         for k in range(rounds):
-            # optionally detach graph to save memory on later rounds
             if detach_after is not None and k >= detach_after:
                 state.x = state.x.detach().requires_grad_(False)
                 state.z = state.z.detach().requires_grad_(False)
                 state.u = state.u.detach().requires_grad_(False)
 
-            # primal: each patch's RAW local proposal. Inactive columns get b=0
-            # so their solve yields x=0 (no proposal).
+            # 1. primal
             state.x = ACNCore.primal(A, b * col_mask, state.z, state.u, rho)
 
-            # conductance on raw-proposal disagreement, masked by column activity
-            # (edges with an inactive endpoint carry no flow, so no Q, no growth).
-            diff = ACNCore.flux(state.x, r_ij, r_ji, ei, ej)        # (B, E, d)
-            Q = diff.pow(2).sum(-1)                                  # (B, E)
-            Q = Q * edge_mask
-            state.Q = Q
-            state.D = ACNCore.conductance_update(state.D, Q, eta_D, gamma_D, D_clip)
-            state.D = state.D * edge_mask    # silent columns -> no wire flow
+            # measure disagreement
+            diff = ACNCore.flux(state.x, r_ij, r_ji, ei, ej)
+            Q = diff.pow(2).sum(-1)
+            state.Q = Q * edge_mask
 
-            # T diffusion steps: consensus now flows through the just-updated D
-            for _ in range(diffusion_steps):
+            # 2. z consensus step (diffusion across the graph). For all-pairs
+            #    topology a single step fully mixes the active vote — no loop.
+            if diffusion_steps <= 1:
                 state.z = ACNCore.consensus_step(
                     state.z, state.x, state.u, r_ij, r_ji,
                     state.D, ei, ej, eta_z, rho,
                 )
-                # inactive columns are not pulled by consensus: keep their z=0
                 state.z = state.z * col_mask
+            else:
+                for _ in range(diffusion_steps):
+                    state.z = ACNCore.consensus_step(
+                        state.z, state.x, state.u, r_ij, r_ji,
+                        state.D, ei, ej, eta_z, rho,
+                    )
+                    state.z = state.z * col_mask
 
-            # dual: only active columns accumulate compromise
-            state.u = state.u + col_mask * (state.x - state.z)
+            # 3. Motor / efference copy / path integration
+            if motor_system is not None:
+                motor, shift_z, shift_u = motor_system(state.z)
+                state.motor = motor
+                # Path integration: update latent position
+                state.z = state.z + col_mask * shift_z
+                # Efference copy: add motor projection to dual
+                #   u = u + (x - z) + shift_u
+                state.u = state.u + col_mask * (state.x - state.z + shift_u)
+            else:
+                # standard dual
+                state.u = state.u + col_mask * (state.x - state.z)
 
             if history is not None:
                 hist = {
@@ -321,6 +204,126 @@ class ACNCore:
                     "u": state.u.detach(), "D": state.D.detach(),
                     "Q": state.Q.detach(), "active": state.active.detach(),
                 }
+                if state.motor is not None:
+                    hist["motor"] = state.motor.detach()
                 history.append(hist)
+
         state.history = history
         return state
+
+    # ------------------------------------------------------------------ #
+    # Unified hierarchy loop (BPTT with detach_after)
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _admm_round(
+        state: ConsensusState,
+        A: torch.Tensor, b: torch.Tensor,
+        r_ij: torch.Tensor, r_ji: torch.Tensor,
+        ei: torch.Tensor, ej: torch.Tensor,
+        col_mask: torch.Tensor, edge_mask: torch.Tensor,
+        diffusion_steps: int,
+        rho: float, eta_z: float,
+        motor_system: "MotorSystem | None",
+    ) -> None:
+        """One ADMM round in-place: primal -> consensus -> dual (+ motor)."""
+        state.x = ACNCore.primal(A, b * col_mask, state.z, state.u, rho)
+        diff = ACNCore.flux(state.x, r_ij, r_ji, ei, ej)
+        Q = diff.pow(2).sum(-1)
+        state.Q = Q * edge_mask
+        if diffusion_steps <= 1:
+            state.z = ACNCore.consensus_step(
+                state.z, state.x, state.u, r_ij, r_ji,
+                state.D, ei, ej, eta_z, rho,
+            )
+            state.z = state.z * col_mask
+        else:
+            for _ in range(diffusion_steps):
+                state.z = ACNCore.consensus_step(
+                    state.z, state.x, state.u, r_ij, r_ji,
+                    state.D, ei, ej, eta_z, rho,
+                )
+                state.z = state.z * col_mask
+        if motor_system is not None:
+            motor, shift_z, shift_u = motor_system(state.z)
+            state.motor = motor
+            state.z = state.z + col_mask * shift_z
+            state.u = state.u + col_mask * (state.x - state.z + shift_u)
+        else:
+            state.u = state.u + col_mask * (state.x - state.z)
+
+    @staticmethod
+    def run_hierarchical(
+        A_b, b_b, r_ij_b, r_ji_b, edges_b, D_init_b, active_b,
+        A_t, b_t, r_ij_t, r_ji_t, edges_t, D_init_t, active_t,
+        decode_down, encode_up,
+        *,
+        rounds, bottom_diffusion_steps, top_diffusion_steps,
+        rho, eta_z, pc_eta_top, pc_eta_bottom,
+        record=False, detach_after=None,
+        bottom_motor_system=None, bottom_z_init=None, top_z_init=None,
+    ):
+        """Unified hierarchy loop with BPTT (detach_after truncates gradient)."""
+        ei_b, ej_b = (edges_b[0], edges_b[1]) if edges_b.shape[0] == 2 else (edges_b[:, 0], edges_b[:, 1])
+        ei_t, ej_t = (edges_t[0], edges_t[1]) if edges_t.shape[0] == 2 else (edges_t[:, 0], edges_t[:, 1])
+
+        B, N_b, d_b = b_b.shape
+        _, N_t, d_t = b_t.shape
+        device, dtype = b_b.device, b_b.dtype
+
+        s_b = make_state(B, N_b, edges_b.shape[-1], d_b, device, dtype,
+                         D_init=D_init_b, z_init=bottom_z_init)
+        s_b.active = active_b
+        s_t = make_state(B, N_t, edges_t.shape[-1], d_t, device, dtype,
+                         D_init=D_init_t, z_init=top_z_init)
+        s_t.active = active_t
+
+        col_mask_b = active_b.unsqueeze(-1)
+        col_mask_t = active_t.unsqueeze(-1)
+        edge_mask_b = active_b[:, ei_b] * active_b[:, ej_b]
+        edge_mask_t = active_t[:, ei_t] * active_t[:, ej_t]
+        s_b.D = s_b.D * edge_mask_b
+        s_t.D = s_t.D * edge_mask_t
+
+        hist_b = [] if record else None
+        hist_t = [] if record else None
+
+        def _fuse_mean(z, active):
+            w = active.unsqueeze(-1)
+            return (w * z).sum(dim=1) / w.sum(dim=1).clamp(min=1e-6)
+
+        for k in range(rounds):
+            if detach_after is not None and k >= detach_after:
+                s_b.x = s_b.x.detach().requires_grad_(False)
+                s_b.z = s_b.z.detach().requires_grad_(False)
+                s_b.u = s_b.u.detach().requires_grad_(False)
+                s_t.x = s_t.x.detach().requires_grad_(False)
+                s_t.z = s_t.z.detach().requires_grad_(False)
+                s_t.u = s_t.u.detach().requires_grad_(False)
+
+            ACNCore._admm_round(s_b, A_b, b_b, r_ij_b, r_ji_b, ei_b, ej_b,
+                                col_mask_b, edge_mask_b, bottom_diffusion_steps,
+                                rho, eta_z, bottom_motor_system)
+
+            z_global = _fuse_mean(s_b.z, s_b.active)
+            ACNCore._admm_round(s_t, A_t, b_t, r_ij_t, r_ji_t, ei_t, ej_t,
+                                col_mask_t, edge_mask_t, top_diffusion_steps,
+                                rho, eta_z, None)
+
+            top_mean = _fuse_mean(s_t.z, s_t.active)
+            prediction_down = decode_down(top_mean)
+            error_up = z_global - prediction_down
+            correction_top = encode_up(error_up)
+            s_t.z = s_t.z + col_mask_t * (pc_eta_top * correction_top).unsqueeze(1)
+            s_b.z = s_b.z + col_mask_b * (pc_eta_bottom * prediction_down).unsqueeze(1)
+
+            if hist_b is not None:
+                hist_b.append({"z": s_b.z.detach(), "active": s_b.active.detach(),
+                               "Q": s_b.Q.detach(), "D": s_b.D.detach()})
+            if hist_t is not None:
+                hist_t.append({"z": s_t.z.detach(), "active": s_t.active.detach(),
+                               "Q": s_t.Q.detach(), "D": s_t.D.detach()})
+
+        s_b.history = hist_b
+        s_t.history = hist_t
+        return s_b, s_t

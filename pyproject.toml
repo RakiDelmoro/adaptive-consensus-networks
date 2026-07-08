@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "adaptive-consensus-networks"
+version = "0.0.1"
+description = "Adaptive Consensus Networks: mini networks with dynamic conductance consensus"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.0",
+    "torchvision>=0.15",
+    "numpy>=1.23",
+    "matplotlib>=3.6",
+    "pyyaml>=6.0",
+    "tqdm>=4.64",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7", "hypothesis>=6"]
+
+[tool.setuptools]
+packages = ["acn"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
