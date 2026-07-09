@@ -126,11 +126,14 @@ class RestrictionMaps(nn.Module):
 class PredictiveMaps(nn.Module):
     """Two small LINEAR maps for the inter-layer predictive-coding exchange.
 
-    `decode_down` turns the top belief into a prediction of the bottom's mean
-    state; `encode_up` turns the resulting error into a correction for the top.
-    Both are learned independently (not tied) so each direction can specialize.
+    `decode_down` turns the top belief into a prediction of the bottom's
+    aggregate signal (the vote distribution when use_vote_input, else the
+    average z); `encode_up` turns the resulting error into a correction for
+    the top. When the aggregate signal is the vote (dim != latent_dim), an
+    extra `decode_down_z` map predicts the bottom z directly for the
+    top-down z-nudge (so the bottom columns get guidance in their own space).
     """
-    def __init__(self, d_bottom: int, d_top: int):
+    def __init__(self, d_bottom: int, d_top: int, d_z: int | None = None):
         super().__init__()
         self.d_bottom = d_bottom
         self.d_top = d_top
@@ -138,6 +141,12 @@ class PredictiveMaps(nn.Module):
         self.encode_up = nn.Linear(d_bottom, d_top, bias=False)
         nn.init.normal_(self.decode_down.weight, std=0.1)
         nn.init.normal_(self.encode_up.weight, std=0.1)
+        # extra map for the bottom z-injection when the inter-layer signal
+        # (d_bottom) is not the bottom latent dim (d_z) — e.g. vote input.
+        self.decode_down_z = None
+        if d_z is not None and d_z != d_bottom:
+            self.decode_down_z = nn.Linear(d_top, d_z, bias=False)
+            nn.init.normal_(self.decode_down_z.weight, std=0.1)
 
 
 # --------------------------------------------------------------------------- #
@@ -302,6 +311,28 @@ def sparse_fuse_vectors(z: torch.Tensor, active: torch.Tensor) -> torch.Tensor:
     summed = (w * z).sum(dim=1)                      # (B, d)
     count = w.sum(dim=1).clamp(min=1.0)               # (B, 1)
     return summed / count
+
+
+def vote_fuse(z: torch.Tensor, active: torch.Tensor, decoder: nn.Module,
+              num_classes: int, temperature: float = 1.0) -> torch.Tensor:
+    """Soft vote distribution: mean over active columns of softmax(decoder(z)).
+
+    z: (B, N, d), active: (B, N), decoder: Module mapping z (B,N,d) -> logits (B,N,C).
+    Returns (B, C) — a differentiable soft vote histogram. Each active column's
+    softmax(decoder(z_i)) is that column's smooth vote over the C classes; the
+    mean of these is the vote distribution the top layer sees.
+
+    Unlike argmax+histogram, this is fully smooth (softmax + mean), so BPTT
+    flows through it with no special handling. As columns get confident their
+    softmaxes sharpen toward one-hot, so the soft vote approaches a hard vote
+    histogram in the limit — but stays differentiable throughout.
+    """
+    logits = decoder(z)                            # (B, N, C) — grad flows to decoder
+    probs = F.softmax(logits / temperature, dim=-1)  # (B, N, C) — smooth per-column vote
+    w = active.unsqueeze(-1)                       # (B, N, 1)
+    summed = (w * probs).sum(dim=1)                # (B, C)
+    count = w.sum(dim=1).clamp(min=1e-6)           # (B, 1)
+    return summed / count                          # (B, C)
 
 
 def logit_margin_confidence(logits: torch.Tensor) -> torch.Tensor:

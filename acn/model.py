@@ -22,6 +22,7 @@ from acn.networks import (
     logit_margin_confidence,
     sparse_fuse,
     sparse_fuse_vectors,
+    vote_fuse,
 )
 from acn.topology import (
     build_all_pairs,
@@ -104,10 +105,15 @@ class AdaptiveConsensusNetwork(nn.Module):
         self._abstract_topo = None
         self._abstract_restriction = None
         self.use_abstract = model_cfg.use_abstract_layer
+        self.use_vote_input = model_cfg.use_vote_input
+        self.vote_temperature = model_cfg.vote_temperature
+        # Dimension of the signal the top layer receives from the bottom:
+        # the vote distribution (num_classes) or the average z (latent_dim).
+        global_in_dim = model_cfg.num_classes if model_cfg.use_vote_input else model_cfg.latent_dim
         if self.use_abstract:
             self.abstract_pos = nn.Parameter(torch.randn(model_cfg.abstract_num_columns, 2))
             self.abstract_encoder = AbstractEncoder(
-                d_in=model_cfg.latent_dim,
+                d_in=global_in_dim,
                 d_out=model_cfg.abstract_dim,
                 num_cols=model_cfg.abstract_num_columns,
                 hidden=model_cfg.abstract_enc_hidden,
@@ -120,13 +126,16 @@ class AdaptiveConsensusNetwork(nn.Module):
             )
             self._build_abstract_topology()
             self.primer_topdown = (
-                Primer(model_cfg.latent_dim, model_cfg.abstract_dim)
+                Primer(global_in_dim, model_cfg.abstract_dim)
                 if model_cfg.use_abstract_topdown_primer
                 else None
             )
-            # predictive-coding inter-layer maps (predictions down, errors up)
+            # predictive-coding inter-layer maps (predictions down, errors up).
+            # The inter-layer signal is the vote distribution (num_classes) when
+            # use_vote_input, else the average z (latent_dim).
             self.predictive_maps = PredictiveMaps(
-                d_bottom=model_cfg.latent_dim, d_top=model_cfg.abstract_dim)
+                d_bottom=global_in_dim, d_top=model_cfg.abstract_dim,
+                d_z=model_cfg.latent_dim)
         else:
             self.abstract_pos = None
             self.abstract_encoder = None
@@ -238,7 +247,15 @@ class AdaptiveConsensusNetwork(nn.Module):
         x_preview = ACNCore.primal(A, b, torch.zeros_like(b), torch.zeros_like(b), self.rho.item())
         x_preview = x_preview * active.unsqueeze(-1)
         z_init = x_preview                                    # each column's OWN answer
-        z_global0 = sparse_fuse_vectors(x_preview, active)    # feedforward-sweep aggregate
+        # The signal the top layer receives from the bottom: either the vote
+        # distribution (mean of softmax(decoder(z_i)) over active columns, C-dim)
+        # or the legacy average z (d-dim). The vote distribution lets the top
+        # layer SEE disagreement among bottom columns.
+        if self.use_vote_input:
+            z_global0 = vote_fuse(x_preview, active, self.bottom_decoder,
+                                  self.cfg.num_classes, self.vote_temperature)
+        else:
+            z_global0 = sparse_fuse_vectors(x_preview, active)    # feedforward-sweep aggregate
 
         r_ij, r_ji = self._bottom_restriction.maps()
 
@@ -265,6 +282,7 @@ class AdaptiveConsensusNetwork(nn.Module):
                 active_t=active2,
                 decode_down=self.predictive_maps.decode_down,
                 encode_up=self.predictive_maps.encode_up,
+                decode_down_z=self.predictive_maps.decode_down_z,
                 rounds=self.cfg.hierarchy_rounds,
                 bottom_diffusion_steps=self.cfg.bottom_diffusion_steps,
                 top_diffusion_steps=self.cfg.top_diffusion_steps,
@@ -276,6 +294,12 @@ class AdaptiveConsensusNetwork(nn.Module):
                 bottom_motor_system=self.bottom_motor,
                 bottom_z_init=z_init,
                 top_z_init=z2_init,
+                # vote-distribution input: pass the bottom decoder so the loop
+                # can recompute the vote each round from the current bottom z.
+                bottom_decoder=self.bottom_decoder if self.use_vote_input else None,
+                num_classes=self.cfg.num_classes,
+                vote_temperature=self.vote_temperature,
+                use_vote_input=self.use_vote_input,
             )
             state_bottom.relevance_logits = s
             state2.relevance_logits = s2

@@ -256,14 +256,23 @@ class ACNCore:
     def run_hierarchical(
         A_b, b_b, r_ij_b, r_ji_b, edges_b, D_init_b, active_b,
         A_t, b_t, r_ij_t, r_ji_t, edges_t, D_init_t, active_t,
-        decode_down, encode_up,
+        decode_down, encode_up, decode_down_z=None,
         *,
         rounds, bottom_diffusion_steps, top_diffusion_steps,
         rho, eta_z, pc_eta_top, pc_eta_bottom,
         record=False, detach_after=None,
         bottom_motor_system=None, bottom_z_init=None, top_z_init=None,
+        bottom_decoder=None, num_classes=10, vote_temperature=1.0,
+        use_vote_input=False,
     ):
-        """Unified hierarchy loop with BPTT (detach_after truncates gradient)."""
+        """Unified hierarchy loop with BPTT (detach_after truncates gradient).
+
+        Each round, the top layer reads the bottom layer's aggregate. If
+        `use_vote_input`, that aggregate is the VOTE DISTRIBUTION (mean of
+        softmax(bottom_decoder(z_b)) over active bottom columns, num_classes-dim)
+        - letting the top layer see disagreement. Otherwise it's the legacy
+        average z_b (d-dim).
+        """
         ei_b, ej_b = (edges_b[0], edges_b[1]) if edges_b.shape[0] == 2 else (edges_b[:, 0], edges_b[:, 1])
         ei_t, ej_t = (edges_t[0], edges_t[1]) if edges_t.shape[0] == 2 else (edges_t[:, 0], edges_t[:, 1])
 
@@ -292,6 +301,14 @@ class ACNCore:
             w = active.unsqueeze(-1)
             return (w * z).sum(dim=1) / w.sum(dim=1).clamp(min=1e-6)
 
+        from acn.networks import vote_fuse   # local import to avoid cycle
+
+        def _bottom_aggregate(z, active):
+            # The signal the top layer reads from the bottom each round.
+            if use_vote_input and bottom_decoder is not None:
+                return vote_fuse(z, active, bottom_decoder, num_classes, vote_temperature)
+            return _fuse_mean(z, active)
+
         for k in range(rounds):
             if detach_after is not None and k >= detach_after:
                 s_b.x = s_b.x.detach().requires_grad_(False)
@@ -305,17 +322,24 @@ class ACNCore:
                                 col_mask_b, edge_mask_b, bottom_diffusion_steps,
                                 rho, eta_z, bottom_motor_system)
 
-            z_global = _fuse_mean(s_b.z, s_b.active)
+            z_global = _bottom_aggregate(s_b.z, s_b.active)
             ACNCore._admm_round(s_t, A_t, b_t, r_ij_t, r_ji_t, ei_t, ej_t,
                                 col_mask_t, edge_mask_t, top_diffusion_steps,
                                 rho, eta_z, None)
 
             top_mean = _fuse_mean(s_t.z, s_t.active)
-            prediction_down = decode_down(top_mean)
+            prediction_down = decode_down(top_mean)          # predicted bottom aggregate (vote or z)
             error_up = z_global - prediction_down
             correction_top = encode_up(error_up)
             s_t.z = s_t.z + col_mask_t * (pc_eta_top * correction_top).unsqueeze(1)
-            s_b.z = s_b.z + col_mask_b * (pc_eta_bottom * prediction_down).unsqueeze(1)
+            # Top-down nudge on the bottom z. When the inter-layer signal is
+            # the vote (dim != latent_dim), use the separate decode_down_z map
+            # so the bottom columns get guidance in their own (latent) space.
+            if decode_down_z is not None:
+                z_nudge = decode_down_z(top_mean)            # (B, latent_dim)
+            else:
+                z_nudge = prediction_down                    # (B, latent_dim) — legacy
+            s_b.z = s_b.z + col_mask_b * (pc_eta_bottom * z_nudge).unsqueeze(1)
 
             if hist_b is not None:
                 hist_b.append({"z": s_b.z.detach(), "active": s_b.active.detach(),

@@ -1,22 +1,35 @@
-"""ACN — Decision Confidence Visualization.
+"""ACN — Thousand-Brains Spotlight Visualization.
 
-A per-sample animated GIF showing the model's DECISION CONFIDENCE as a simple
-2x5 grid of boxes (digits 0-9):
+A per-sample animated GIF showing the full two-layer decision story as it
+forms over consensus rounds.  For each sample row we show FOUR panels:
 
-  1. Input digit  (ground truth + ✓/✗ tag)
-  2. A 2x5 grid where each cell = one digit (0-4 on top, 5-9 on bottom):
-       * blank (black) if the model's softmax confidence for that digit is < 50%
-         (it's not confident enough to be part of the decision)
-       * colored with that digit's label color if confidence >= 50%, with
-         brightness rising from dim (at 50%) to full bright (at 100%) — so the
-         STRENGTH OF THE COLOR IS THE CONFIDENCE.
-     The model's predicted digit (argmax) always gets a green border so the
-     decision is visible even when nothing crosses 50%. The percentage is
-     printed in each lit cell.
+  1. Input digit            — the raw image with the ground-truth label and a
+                              ✓/✗ tag (tag taken from the same snapshot as the
+                              grids, so it always matches the winner).
+  2. Bottom-layer columns   — every bottom-layer column drawn on the image
+                              grid at its spatial patch location, colored by
+                              the digit that column currently votes for.
+                              Brightness = that column's confidence in its
+                              choice; inactive (gated-off) columns are dim
+                              slate.  So you watch the bottom "thousand brains"
+                              settle on a digit across the image.
+  3. Top-layer columns      — every abstract-layer column (a small 2×4 grid)
+                              colored by its vote the same way.  The top layer
+                              is coarser/fewer columns, so it tells a
+                              complementary, higher-level story.
+  4. Decision = mix         — the informative readout: the bottom layer's
+                              fused vote and the top layer's fused vote are
+                              shown as two stacked colored bars, each labeled
+                              with its confidence WEIGHT (w_bot / w_top).  A
+                              "⊕ weighted vote" arrow points to a third bar —
+                              the FINAL decision = w_top·top + w_bot·bottom —
+                              whose winning digit is outlined in green and
+                              labeled with its percentage.  This makes it
+                              visually obvious that the last decision
+                              confidence is the MIX of the two layers.
 
-As the consensus rounds animate, a digit crosses 50% and its cell brightens —
-you watch the decision form. The bottom/top column grids and the weighted-vote
-bars are intentionally NOT shown; the 2x5 confidence grid is the whole story.
+At the very bottom of the figure a horizontal DIGIT COLOR LEGEND shows the
+ten digit→color mappings so every panel is readable at a glance.
 
 Two entry points (signatures unchanged so scripts/viz_spotlight.py still works):
   * :func:`make_spotlight_gif`            — one row per digit class (0-9), batched 4/batch
@@ -67,6 +80,11 @@ DIGIT_COLORS_RGB = np.array([
     [0.471, 0.208, 0.059],  # 8 brown
     [0.420, 0.439, 0.502],  # 9 gray
 ], dtype=np.float32)
+
+# color for an inactive (gated-off) column
+_INACTIVE_RGB = np.array([0.10, 0.11, 0.14], dtype=np.float32)
+# brightness floor so a just-active column is still visible
+_FLOOR = 0.35
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -158,11 +176,8 @@ class V3Snapshot:
             self.abstract_active_round = None
             self.abstract_fused_round = None
 
-        # combined fused per round. In the unified predictive-coding hierarchy both
-        # layers run the SAME number of rounds (hierarchy_rounds) in lockstep, so
-        # the per-round histories are already aligned. Stored as a diagnostic sum
-        # (bottom mean + top mean); the model's actual readout is the
-        # confidence-weighted cooperative vote of the two layers' readouts.
+        # combined fused per round (diagnostic sum; the model's real readout is
+        # the confidence-weighted cooperative vote, recomputed per frame).
         if self.bottom_fused_round is not None:
             abs_aligned = (self.abstract_fused_round if self.abstract_fused_round is not None
                            else np.zeros_like(self.bottom_fused_round))
@@ -173,7 +188,7 @@ class V3Snapshot:
         # final combined fused
         self.fused_final = self.bottom_fused + self.abstract_fused      # (B, C)
 
-        # roster / sizes (for the input-panel spotlight overlay, if wanted)
+        # roster / sizes (for the bottom spatial-grid layout)
         b_topo = model._bottom_topo
         self.roster = b_topo.roster
         self.coords = b_topo.coords.cpu().numpy()
@@ -201,11 +216,25 @@ def _sparse_fuse_np(logits, active):
     return summed / count
 
 
+def _softmax_np(logits):
+    """Softmax over the last axis (numpy). logits: (..., C) -> (..., C)."""
+    x = logits - logits.max(axis=-1, keepdims=True)
+    e = np.exp(x)
+    return e / e.sum(axis=-1, keepdims=True)
+
+
+def _column_probs_softmax(logits_n_c):
+    """Per-column softmax. logits_n_c: (N, C) -> (N, C) probs."""
+    return _softmax_np(logits_n_c)
+
+
 def _confidence(pred_logits):
     """Softmax confidence of the predicted class."""
     p = np.exp(pred_logits - pred_logits.max(axis=-1, keepdims=True))
     p /= p.sum(axis=-1, keepdims=True)
     return p.max(axis=-1)
+
+
 def _weighted_vote_data(snap, s: int, round_idx: int):
     """Collect the cooperative readout data for one sample at one round.
 
@@ -213,8 +242,8 @@ def _weighted_vote_data(snap, s: int, round_idx: int):
         pred = w_top * pred_top + w_bot * pred_bottom
     where w_top/w_bot are the normalized logit margins (top1-top2) of each
     layer's fused readout. This helper returns exactly those pieces so the
-    panel can show: each layer's per-digit mean (its vote), each layer's
-    confidence weight (a gauge), and the weighted combination (the verdict,
+    mix panel can show: each layer's per-digit vote (a stacked color bar),
+    each layer's confidence weight, and the weighted combination (the verdict,
     guaranteed to match snap.pred_class).
     """
     # per-layer fused readouts at this round
@@ -244,56 +273,71 @@ def _weighted_vote_data(snap, s: int, round_idx: int):
     return {"pred_top": pred_top, "pred_bottom": pred_bottom,
             "w_top": w_top, "w_bot": w_bot,
             "fused": fused, "winner": winner}
+
+
+def _cell_color(choice, active):
+    """RGB color for one column cell given its digit choice and active flag.
+
+    Active -> solid digit color (no confidence dimming; the color IS the vote).
+    Inactive -> dark slate (column is present but not voting this round).
+    """
+    if not active:
+        return _INACTIVE_RGB
+    return DIGIT_COLORS_RGB[int(choice)]
+
+
+def _top_grid_shape(n2):
+    """Pick a (rows, cols) grid shape for n2 abstract columns."""
+    if n2 <= 4:
+        return 1, n2
+    if n2 <= 9:
+        return 2, int(np.ceil(n2 / 2))
+    return int(np.ceil(np.sqrt(n2))), int(np.ceil(n2 / np.ceil(np.sqrt(n2))))
+
+
 # ════════════════════════════════════════════════════════════════════
 # Figure builder shared by both GIFs
 # ════════════════════════════════════════════════════════════════════
-def _softmax_np(logits):
-    """Softmax over the last axis (numpy). logits: (..., C) -> (..., C)."""
-    x = logits - logits.max(axis=-1, keepdims=True)
-    e = np.exp(x)
-    return e / e.sum(axis=-1, keepdims=True)
 
+def _build_figure(nsamp, row_titles, snap):
+    """Create the figure + artists for the three-panel spotlight GIF.
 
-def _confidence_grid_rgb(probs, floor=0.30):
-    """Render the 10 digit probabilities as a 2x5 RGB confidence grid.
+    Layout per row (3 panels):
+        [input digit | bottom columns grid | top columns grid]
+    Plus a VERTICAL digit-color legend pinned to the right side of the figure.
 
-    Each cell = one digit (row-major: 0..4 on top, 5..9 on bottom).
-      * prob < 0.5  -> BLANK (black): the model isn't confident enough in that
-        digit for it to be part of the decision.
-      * prob >= 0.5 -> the digit's label COLOR, brightness rising from `floor`
-        (dim, at 50%) to 1.0 (full bright, at 100%). So a just-over-50% cell is
-        a dim version of its color and a 95% cell is full-bright — the strength
-        of the color IS the confidence.
+    All columns are shown (even inactive). Active columns are colored by their
+    predicted digit (solid color, no confidence dimming). Inactive columns are
+    dark slate (present but not voting).
     """
-    grid = np.zeros((2, 5, 3), dtype=np.float32)
-    for d in range(10):
-        r, c = d // 5, d % 5
-        p = float(probs[d])
-        if p >= 0.5:
-            b = floor + (1.0 - floor) * ((p - 0.5) / 0.5)
-            grid[r, c] = DIGIT_COLORS_RGB[d] * b
-    return grid
+    has_abstract = snap.has_abstract
+    n_bottom = snap.N
+    coords = snap.coords                       # (N, 2) row,col in image px
+    sizes = snap.patch_sizes                   # (N,)
+    # draw largest patches first so smaller (finer) columns land on top
+    draw_order = np.argsort(-sizes, kind="stable")
 
+    n_top = snap.N2 if has_abstract else 0
+    top_rows, top_cols = _top_grid_shape(n_top) if n_top > 0 else (1, 1)
 
-def _build_figure(nsamp, row_titles, has_abstract):
-    """Create the figure + artists for the confidence-grid GIF.
-
-    Layout per row: [input digit | 2x5 confidence grid]. Each of the 10 cells
-    is a digit 0-9: blank if the model's softmax confidence for it is < 50%,
-    otherwise colored with that digit's label color, dim near 50% and bright
-    near 100%. The model's predicted digit (argmax) always gets a green border
-    so the decision is visible even when nothing crosses 50%.
-    """
-    n_panels = 2   # input | confidence grid
-    width_ratios = [1.0, 3.0]
-    fig = plt.figure(figsize=(9, 2.6 * nsamp + 0.6))
+    n_panels = 3
+    width_ratios = [1.0, 1.6, 0.9 + 0.18 * top_cols]
+    # taller top margin for small batches so the suptitle doesn't crash into
+    # the panel titles. Reserve a fixed ~0.7 inch header regardless of nsamp.
+    fig_h = 2.95 * nsamp + 1.2
+    fig = plt.figure(figsize=(12.5, fig_h), facecolor="white")
+    top_margin = 1.0 - 0.7 / fig_h          # fraction of fig reserved at top
     gs = fig.add_gridspec(nsamp, n_panels, width_ratios=width_ratios)
-    fig.subplots_adjust(left=0.04, right=0.98, top=0.92, bottom=0.04,
-                        wspace=0.12, hspace=0.30)
+    # panels use right=0.78 so the legend (starting at 0.80) has clear separation
+    fig.subplots_adjust(left=0.03, right=0.78, top=top_margin, bottom=0.04,
+                        wspace=0.18, hspace=0.32)
 
-    artists = {"fig": fig, "gs": gs, "has_abstract": has_abstract}
+    artists = {"fig": fig, "gs": gs, "has_abstract": has_abstract,
+               "n_bottom": n_bottom, "n_top": n_top,
+               "draw_order": draw_order, "coords": coords, "sizes": sizes,
+               "top_rows": top_rows, "top_cols": top_cols}
 
-    # ── input digit axes ──
+    # ── panel 0: input digit ──
     artists["img_axes"] = []
     artists["img_ims"] = []
     for r in range(nsamp):
@@ -304,86 +348,154 @@ def _build_figure(nsamp, row_titles, has_abstract):
         artists["img_axes"].append(ax)
         artists["img_ims"].append(im)
 
-    # ── 2x5 confidence grid axes ──
-    artists["conf_axes"] = []
-    artists["conf_ims"] = []           # per-sample: imshow (2,5,3) background
-    artists["conf_pct_texts"] = []     # per-sample: 10 text (percentage in each cell)
-    artists["conf_winner_rects"] = []  # per-sample: green border on the argmax cell
+    # ── panel 1: bottom-layer columns on the image grid ──
+    artists["bot_axes"] = []
+    artists["bot_rects"] = []        # per sample: list[N] of Rectangle (in draw_order)
     for r in range(nsamp):
         ax = fig.add_subplot(gs[r, 1])
-        im = ax.imshow(np.zeros((2, 5, 3)), interpolation="nearest", vmin=0, vmax=1)
-        ax.set_xlim(-0.5, 4.5)
-        ax.set_ylim(1.5, -0.5)          # row 0 (digits 0-4) on top
+        ax.set_xlim(-0.5, 28.5)
+        ax.set_ylim(28.5, -0.5)
+        ax.set_aspect("equal")
         ax.set_xticks([]); ax.set_yticks([])
-        # white cell borders (static) + static digit-number labels
-        for d in range(10):
-            rr, cc = d // 5, d % 5
-            ax.add_patch(plt.Rectangle((cc - 0.5, rr - 0.5), 1, 1, fill=False,
-                                       edgecolor="white", linewidth=1.2, zorder=2))
-            ax.text(cc, rr, str(d), ha="center", va="center", fontsize=12,
-                    color="#71717a", fontweight="bold", zorder=3)
-        # percentage text per cell (updated each frame; blank if < 50%)
-        pct_texts = []
-        for d in range(10):
-            rr, cc = d // 5, d % 5
-            t = ax.text(cc, rr + 0.30, "", ha="center", va="center", fontsize=8,
-                        color="white", fontweight="bold", zorder=4)
-            pct_texts.append(t)
-        # green winner border (moved each frame to the argmax cell)
-        win_rect = mpatches.Rectangle((-0.5, -0.5), 1, 1, fill=False,
-                                      edgecolor="#16a34a", linewidth=3.0, zorder=5)
-        ax.add_patch(win_rect)
-        artists["conf_axes"].append(ax)
-        artists["conf_ims"].append(im)
-        artists["conf_pct_texts"].append(pct_texts)
-        artists["conf_winner_rects"].append(win_rect)
-    artists["conf_axes"][0].set_title(
-        "Decision confidence  (blank < 50%  \u00b7  color strength = confidence)",
-        fontsize=10, pad=6, color="#22d3ee")
+        rects = []
+        for idx in draw_order:
+            idx = int(idx)
+            row, col = int(coords[idx, 0]), int(coords[idx, 1])
+            sz = int(sizes[idx])
+            rect = mpatches.Rectangle((col, row), sz, sz,
+                                      facecolor=_INACTIVE_RGB,
+                                      edgecolor="#e4e4e7", linewidth=0.4,
+                                      alpha=0.9, zorder=3)
+            ax.add_patch(rect)
+            rects.append(rect)
+        artists["bot_rects"].append(rects)
+        artists["bot_axes"].append(ax)
+    artists["bot_axes"][0].set_title(
+        "Bottom-layer columns\n(color = predicted digit)",
+        fontsize=10, pad=6, color="black")
+
+    # ── panel 2: top-layer columns in a small grid ──
+    artists["top_axes"] = []
+    artists["top_rects"] = []        # per sample: list[N2] of Rectangle
+    for r in range(nsamp):
+        ax = fig.add_subplot(gs[r, 2])
+        ax.set_xlim(-0.5, top_cols - 0.5)
+        ax.set_ylim(top_rows - 0.5, -0.5)
+        ax.set_aspect("equal")
+        ax.set_xticks([]); ax.set_yticks([])
+        rects = []
+        for i in range(n_top):
+            rr, cc = i // top_cols, i % top_cols
+            rect = mpatches.Rectangle((cc - 0.5, rr - 0.5), 1, 1,
+                                      facecolor=_INACTIVE_RGB,
+                                      edgecolor="#e4e4e7", linewidth=1.0,
+                                      alpha=0.95, zorder=3)
+            ax.add_patch(rect)
+            rects.append(rect)
+        if not has_abstract:
+            ax.text(0, 0, "no abstract\nlayer", ha="center", va="center",
+                    fontsize=10, color="#71717a")
+        artists["top_rects"].append(rects)
+        artists["top_axes"].append(ax)
+    artists["top_axes"][0].set_title(
+        "Top-layer columns\n(higher-level vote)", fontsize=10, pad=6,
+        color="black")
+
+    # ── right-side VERTICAL digit-color legend ──
+    # Exactly 10 swatches (digits 0-9), each colored with its digit color
+    # and labeled with the digit number centered on the swatch. Nothing else.
+    legend_ax = fig.add_axes([0.82, 0.04, 0.16, top_margin - 0.06])
+    legend_ax.set_xlim(-0.5, 1.2)
+    legend_ax.set_ylim(-0.5, 9.5)
+    legend_ax.set_xticks([]); legend_ax.set_yticks([])
+    legend_ax.set_facecolor("white")
+    for spine in legend_ax.spines.values():
+        spine.set_visible(False)
+    for d in range(10):
+        swatch = mpatches.Rectangle((-0.4, d - 0.4), 0.8, 0.8,
+                                    facecolor=DIGIT_COLORS_RGB[d],
+                                    edgecolor="#e4e4e7", linewidth=0.6)
+        legend_ax.add_patch(swatch)
+        legend_ax.text(0.0, d, str(d), ha="center", va="center",
+                       fontsize=14, color="white", fontweight="bold")
+    artists["legend_ax"] = legend_ax
+    artists["top_margin"] = top_margin
 
     return artists
+
+
+def _update_col_grid(rects, choices_n, active_n):
+    """Update a column-grid's Rectangle facecolors for one frame.
+
+    rects: list of matplotlib Rectangles (length N).
+    choices_n: (N,) int digit choice per column.
+    active_n: (N,) bool/float active mask.
+    Active columns get solid digit color; inactive get dark slate.
+    """
+    n = len(rects)
+    for i in range(n):
+        act = bool(active_n[i])
+        ch = int(choices_n[i])
+        rects[i].set_facecolor(_cell_color(ch, act))
 
 
 def _draw_round(artists, snap, images_np, labels_np, round_idx, n_rounds,
                 row_titles):
     """Update all artists for one animation frame (one consensus round).
 
-    Each sample: input digit + the 2x5 confidence grid for the model's readout
-    at THIS round (softmax of the confidence-weighted fused readout). As
-    consensus proceeds, a digit crosses 50% and its cell brightens.
+    Each sample: input digit + bottom columns grid + top columns grid.
+    Active columns are colored by their predicted digit (solid color, no
+    confidence dimming); inactive columns are dark slate (present but not
+    voting). All columns are shown every round.
     """
     nsamp = len(images_np)
+    has_abstract = artists["has_abstract"]
+    draw_order = artists["draw_order"]
+
     for s in range(nsamp):
+        # input digit
         artists["img_ims"][s].set_data(images_np[s])
 
-        # the model's real (confidence-weighted) readout at this round -> softmax
-        vd = _weighted_vote_data(snap, s, round_idx)
-        probs = _softmax_np(vd["fused"])                  # (10,)
-        grid = _confidence_grid_rgb(probs)                # (2, 5, 3)
-        artists["conf_ims"][s].set_data(grid)
+        # bottom column grid at this round
+        if snap.bottom_choices_round is not None and round_idx < len(snap.bottom_choices_round):
+            b_choices = snap.bottom_choices_round[round_idx, s]      # (N,)
+            b_active = snap.bottom_active_round[round_idx, s]        # (N,)
+        else:
+            b_choices = snap.bottom_choices[s]
+            b_active = snap.active[s]
+        # bot_rects are in draw_order; index back to column index
+        rects_ordered = artists["bot_rects"][s]
+        for k, idx in enumerate(draw_order):
+            idx = int(idx)
+            act = bool(b_active[idx])
+            ch = int(b_choices[idx])
+            rects_ordered[k].set_facecolor(_cell_color(ch, act))
 
-        # percentage text in each lit cell (>= 50%); blank otherwise
-        for d in range(10):
-            p = float(probs[d])
-            artists["conf_pct_texts"][s][d].set_text(f"{p:.0%}" if p >= 0.5 else "")
-        # green border on the model's predicted digit (argmax), always visible
-        w = vd["winner"]
-        wr, wc = w // 5, w % 5
-        artists["conf_winner_rects"][s].set_xy((wc - 0.5, wr - 0.5))
+        # top column grid at this round
+        if has_abstract and snap.abstract_choices_round is not None \
+                and round_idx < len(snap.abstract_choices_round):
+            t_choices = snap.abstract_choices_round[round_idx, s]    # (N2,)
+            t_active = snap.abstract_active_round[round_idx, s]      # (N2,)
+        elif has_abstract:
+            t_choices = snap.abstract_choices[s]
+            t_active = snap.active2[s]
+        else:
+            t_choices = np.zeros(0, dtype=int)
+            t_active = np.zeros(0)
+        if has_abstract:
+            _update_col_grid(artists["top_rects"][s], t_choices, t_active)
 
-    r = min(round_idx + 1, n_rounds)
-    artists["fig"].suptitle(
-        f"ACN \u2014 Decision Confidence  |  Round {r}/{n_rounds}",
-        fontsize=13, color="#22d3ee")
+    # NOTE: suptitle is set by the caller (_render_batch_frames), not here,
+    # to avoid double/overlapping titles.
 
 
 # ════════════════════════════════════════════════════════════════════
-# Batched GIF rendering (4 samples per batch so the 3-stack weighted-vote
-# panel has enough vertical room — no y-axis overlap)
+# Batched GIF rendering (4 samples per batch so the four-panel layout has
+# enough vertical room per row)
 # ════════════════════════════════════════════════════════════════════
 
 def _render_batch_frames(model, batch_imgs, batch_labels, row_title_fn,
-                          linger_frames, suptitle_fn):
+                         linger_frames, suptitle_fn):
     """Render one batch (≤4 samples) to a list of PIL.Image frames.
 
     Each frame is one consensus round; `linger_frames` copies of the final
@@ -404,17 +516,17 @@ def _render_batch_frames(model, batch_imgs, batch_labels, row_title_fn,
     if images_np.ndim == 2:               # single sample -> add a dim
         images_np = images_np[None]
 
-    # row titles from THIS batch's snapshot (tag consistent with the grid)
+    # row titles from THIS batch's snapshot (tag consistent with the grids)
     row_titles = [row_title_fn(j, int(snap.pred_class[j]), int(labels_np[j]))
                   for j in range(nsamp)]
 
     n_rounds = len(snap.bottom_choices_round) if snap.bottom_choices_round is not None else 1
-    artists = _build_figure(nsamp, row_titles, snap.has_abstract)
+    artists = _build_figure(nsamp, row_titles, snap)
 
     frames = []
     for k in range(n_rounds):
         _draw_round(artists, snap, images_np, labels_np, k, n_rounds, row_titles)
-        artists["fig"].suptitle(suptitle_fn(k, n_rounds), fontsize=13, color="#22d3ee")
+        artists["fig"].suptitle(suptitle_fn(k, n_rounds), fontsize=13, color="black")
         artists["fig"].canvas.draw()
         w, h = artists["fig"].canvas.get_width_height()
         buf = artists["fig"].canvas.buffer_rgba()
@@ -445,15 +557,16 @@ def make_spotlight_gif(
     linger_frames: int = 15,
     batch_size: int = 4,
 ) -> None:
-    """Create the Thousand-Brains Grid GIF (one row per digit class), BATCHED.
+    """Create the Thousand-Brains Spotlight GIF (one row per digit class), BATCHED.
 
     Samples are split into batches of `batch_size` (default 4) so each batch
-    figure has only 4 rows — giving the 3-stack weighted-vote panel enough
-    vertical room (no y-axis label overlap). The GIF plays batch 1 → linger →
-    batch 2 → linger → ... then holds on the last batch's final frame (loop=1).
+    figure has only 4 rows — giving the four-panel layout enough vertical
+    room. The GIF plays batch 1 → linger → batch 2 → linger → ... then holds
+    on the last batch's final frame (loop=1).
 
-    Each row: input digit | bottom grid (confidence-dimmed) | top grid |
-    weighted vote (top + bottom → fused, with confidence gauges).
+    Each row: input digit | bottom columns grid | top columns grid |
+    decision mix (bottom + top → weighted final, with the winner highlighted).
+    A horizontal digit-color legend sits at the bottom of every frame.
     """
     # pick one sample per digit class if possible
     labels_np_all = labels.cpu().numpy()
@@ -468,10 +581,6 @@ def make_spotlight_gif(
         remaining = [i for i in range(len(labels_np_all)) if i not in sample_indices]
         sample_indices.extend(remaining[:n_samples - len(sample_indices)])
     sample_indices = sample_indices[:n_samples]
-
-    dev = next(model.parameters()).device
-    all_imgs = images[sample_indices].to(dev)
-    all_labels = labels[sample_indices]
 
     # reproducible gate
     torch.manual_seed(42)
@@ -490,7 +599,7 @@ def make_spotlight_gif(
         batch_labels = labels[idxs]
 
         def suptitle(k, R, _bi=bi):
-            return (f"ACN \u2014 Decision Confidence  |  "
+            return (f"ACN \u2014 Thousand-Brains Spotlight  |  "
                     f"batch {_bi + 1}/{n_batches}  |  Round {min(k + 1, R)}/{R}")
         frames = _render_batch_frames(
             model, batch_imgs, batch_labels, row_title_fn,
@@ -552,12 +661,11 @@ def make_robustness_spotlight_gif(
     linger_frames: int = 20,
     batch_size: int = 4,
 ) -> None:
-    """Create the Robustness Grid GIF: one digit under 8 corruptions, BATCHED.
+    """Create the Robustness Spotlight GIF: one digit under 8 corruptions, BATCHED.
 
     8 conditions (clean + 7 corruptions) split into 2 batches of 4 so each
-    batch figure has only 4 rows (the 3-stack weighted-vote panel gets enough
-    vertical room). The GIF plays batch 1 (rotations) → linger → batch 2
-    (shifts/occlude/noise) → linger, then holds (loop=1).
+    batch figure has only 4 rows. The GIF plays batch 1 (rotations) → linger
+    → batch 2 (shifts/occlude/noise) → linger, then holds (loop=1).
     """
     dev = next(model.parameters()).device
     img = images[sample_idx:sample_idx+1].to(dev)
@@ -597,7 +705,7 @@ def make_robustness_spotlight_gif(
             return f"{_names[j]}  {tag}"
 
         def suptitle(k, R, _bi=bi):
-            return (f"ACN — Robustness Confidence  |  GT: {label}  |  "
+            return (f"ACN — Robustness Spotlight  |  GT: {label}  |  "
                     f"batch {_bi + 1}/{n_batches}  |  Round {min(k + 1, R)}/{R}")
         frames = _render_batch_frames(
             model, batch_imgs, batch_labels, _rtf,
@@ -605,5 +713,5 @@ def make_robustness_spotlight_gif(
         all_frames.extend(frames)
 
     _save_frames_as_gif(all_frames, path, duration_ms)
-    print(f"Robustness Grid GIF saved: {path}  ({n_batches} batches × ≤{batch_size}, "
+    print(f"Robustness Spotlight GIF saved: {path}  ({n_batches} batches × ≤{batch_size}, "
           f"{len(all_frames)} frames)")

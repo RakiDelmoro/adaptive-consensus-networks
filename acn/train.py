@@ -20,6 +20,8 @@ from torchvision import datasets, transforms
 
 from acn.config import ExperimentConfig, get_preset
 from acn.model import AdaptiveConsensusNetwork
+from acn.robustness import evaluate_robustness, ROBUSTNESS_VERSIONS
+from acn.visualize import make_spotlight_gif, make_robustness_spotlight_gif
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -80,6 +82,19 @@ def compute_z_loss(s: torch.Tensor) -> torch.Tensor:
     return (lse ** 2).mean()
 
 
+def _load_test_tensors(test_dl: DataLoader):
+    """Collect the full test set as two tensors (X, y) on CPU.
+
+    Done once so robustness evaluation and the spotlight GIFs can reuse the
+    same fixed samples at every snapshot interval.
+    """
+    xs, ys = [], []
+    for x, y in test_dl:
+        xs.append(x)
+        ys.append(y)
+    return torch.cat(xs), torch.cat(ys)
+
+
 def train(cfg: ExperimentConfig):
     random.seed(cfg.train.seed)
     np.random.seed(cfg.train.seed)
@@ -111,7 +126,17 @@ def train(cfg: ExperimentConfig):
     best_val = 0.0
     best_path = None
     metrics_log: list[dict] = []
+    robustness_log: list[dict] = []
     start = time.time()
+
+    # Fixed test-set tensors for robustness evaluation + spotlight GIFs.
+    # We pull the full test set once so the same 1000 samples (and the same
+    # one-per-digit spotlight rows) are reused at every snapshot interval —
+    # making robustness accuracy and the GIFs comparable across epochs.
+    Xte, yte = _load_test_tensors(test_dl)
+    n_robust = min(cfg.train.robustness_n_samples, len(Xte))
+    rob_X, rob_y = Xte[:n_robust], yte[:n_robust]
+    log.info(f"robustness eval set: {n_robust} test samples × {len(ROBUSTNESS_VERSIONS)} versions")
 
     for epoch in range(1, cfg.train.epochs + 1):
         model.train()
@@ -202,6 +227,31 @@ def train(cfg: ExperimentConfig):
         if epoch % cfg.train.snapshot_every == 0:
             ck = save_dir / f"model_e{epoch:03d}.pt"
             torch.save({"model": model.state_dict(), "config": cfg, "epoch": epoch}, ck)
+
+            # ── robustness evaluation on the fixed 1000-sample set ──
+            rob = evaluate_robustness(model, rob_X, rob_y, seed=42)
+            rob_line = "  ".join(f"{k}={v:.3f}" for k, v in rob.items())
+            log.info(f"  [snapshot e{epoch:02d}] robustness: {rob_line}")
+            robustness_log.append({"epoch": epoch, **rob})
+            (save_dir / "robustness_log.json").write_text(
+                json.dumps(robustness_log, indent=2) + "\n")
+
+            # ── spotlight GIFs for this checkpoint ──
+            try:
+                make_spotlight_gif(
+                    model, rob_X, rob_y,
+                    path=save_dir / f"model_e{epoch:03d}_spotlight.gif",
+                    n_samples=min(cfg.train.viz_n_samples, n_robust),
+                    duration_ms=200, linger_frames=15,
+                )
+                make_robustness_spotlight_gif(
+                    model, rob_X, rob_y,
+                    path=save_dir / f"model_e{epoch:03d}_robustness_spotlight.gif",
+                    sample_idx=cfg.train.viz_sample_idx,
+                    duration_ms=250, linger_frames=20,
+                )
+            except Exception as e:  # viz must never break training
+                log.info(f"  [snapshot e{epoch:02d}] spotlight GIF skipped: {e}")
 
         (save_dir / "metrics.json").write_text(json.dumps(metrics_log, indent=2) + "\n")
 

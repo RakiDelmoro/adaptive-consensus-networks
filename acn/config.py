@@ -96,6 +96,16 @@ class ModelConfig:
     pc_eta_top: float = 0.5          # gain on the error that reaches the top
     pc_eta_bottom: float = 0.1       # gain on the prediction that nudges the bottom
 
+    # ── Top-layer input: vote distribution vs average z ──
+    # If True, the top (abstract) layer sees the bottom columns' VOTE
+    # DISTRIBUTION (mean of softmax(decoder(z_i)) over active columns, 10-dim)
+    # instead of the average z-vector (32-dim). The vote distribution lets the
+    # top layer SEE disagreement among the bottom columns (e.g. 4 say 7, 4 say
+    # 1) rather than a mushy average. Fully differentiable (softmax+mean).
+    # Set False to restore the legacy average-z input for A/B comparison.
+    use_vote_input: bool = True
+    vote_temperature: float = 1.0    # softmax temperature for the vote (1.0 = normal)
+
 
 @dataclass(frozen=True)
 class TrainConfig:
@@ -110,6 +120,10 @@ class TrainConfig:
     snapshot_every: int = 5
     device: str = "cuda"
     viz_after_train: bool = True
+    # robustness + spotlight checks run at every snapshot_every interval
+    robustness_n_samples: int = 1000
+    viz_n_samples: int = 10
+    viz_sample_idx: int = 0
 
 
 @dataclass(frozen=True)
