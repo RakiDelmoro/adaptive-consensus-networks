@@ -1,4 +1,4 @@
-"""Configuration dataclasses for ACN."""
+"""Configuration for PCN-ACN (predictive-coding consensus network, EP-trained)."""
 
 from __future__ import annotations
 
@@ -11,100 +11,38 @@ import yaml
 
 @dataclass(frozen=True)
 class DataConfig:
-    dataset: str = "mnist"
     image_size: int = 28
-    patch_size: int = 7
-    stride: int = 3
-    normalize: bool = True
+    patch_size: int = 5
+    stride: int = 2
     val_frac: float = 0.1
     train_subset: int | None = None
-
-    decomposition_mode: str = "multi"
-    multi_scale_specs: tuple[tuple[int, int], ...] = ((4, 4), (6, 6), (8, 8))
-    pool_to: int = 4
 
 
 @dataclass(frozen=True)
 class ModelConfig:
-    latent_dim: int = 32
+    # ── layer dims ──
+    latent_dim: int = 32          # d  (per-column latent dim)
     num_classes: int = 10
-    enc_hidden: tuple[int, ...] = (64, 64)
-    dec_hidden: tuple[int, ...] = (64, 64)
-    rounds: int = 20
-    diffusion_steps: int = 1
-    rho: float = 1.0
-    eta_z: float = 0.1
 
-    D_init: float = 1.0
-    # Bottom layer topology: ALL-PAIRS — every active column is wired to every
-    # other active column, regardless of image position. The consensus vote is
-    # a long-range phenomenon (active columns voting on the SAME object must
-    # reconcile directly, not hop-by-hop through strangers), so the active↔active
-    # wires (kept live by the edge_mask) realize "active columns talk to each
-    # other wherever they are" — the Thousand-Brains voting principle. With
-    # all-pairs, ONE diffusion step fully mixes the active vote, so
-    # bottom_diffusion_steps=1 (no loop needed). The top (abstract) layer is
-    # also all-pairs (8 conceptual columns).
-    topology_mode: str = "allpairs"
-    A_eps: float = 1e-2
-    detach_after: int | None = 4
-    local_loss_weight: float = 0.5
+    # ── modules ──
+    enc_hidden: tuple[int, ...] = (256, 256)
+    lateral_hidden: tuple[int, ...] = (256,)
 
-    column_sparsity_weight: float = 0.001
-    column_z_loss_weight: float = 0.001
-
-    # ────────────────────────────────────────────
-    # Thousand-Brains reference-frame extensions
-    # ────────────────────────────────────────────
-    use_positional_encoding: bool = True
-    pos_embed_dim: int = 32
-
-    # Motor / efference copy / path integration
-    use_motor: bool = True
-    motor_dim: int = 2
-
-    # Top-down prior for the abstract layer (the feedforward-sweep aggregate
-    # reaches the top via a learned projection)
-    use_abstract_topdown_primer: bool = True
-
-    # Hard top-k gate
-    topk_k: int = 8
+    # ── gating (all-active by default) ──
+    topk_k: int = 1000            # >= N -> all columns active
     topk_tau: float = 0.5
 
-    # Abstract Layer 2
-    use_abstract_layer: bool = True
-    abstract_num_columns: int = 8
-    abstract_dim: int = 16
-    abstract_rounds: int = 5
-    abstract_topk: int = 4
-    abstract_dec_hidden: tuple[int, ...] = (32, 32)
-    abstract_enc_hidden: tuple[int, ...] = (32, 32)
+    # ── energy strengths (κ = lateral consensus, the key knob) ──
+    kappa: float = 0.1            # lateral consensus (prediction-error coupling)
+    lam_col: float = 1.0          # per-column prediction error
+    lam_output: float = 1.0       # per-column output prediction error
 
-    # Top-down abstract primer into bottom layer
-    use_abstract_topdown_primer: bool = True
+    # ── settle (gradient descent on the energy) ──
+    k_max: int = 20               # settle rounds
+    alpha: float = 0.5            # gradient-descent step size
 
-    # ────────────────────────────────────────────
-    # unified hierarchy + predictive-coding fusion
-    # ONE outer loop steps both layers together; a single linear (Kalman-style)
-    # predictive-coding exchange reconciles them each round (predictions down,
-    # errors up). The top layer's compressed belief is the verdict; the bottom's
-    # readout becomes a (small) residual blend. See ACNCore.run_hierarchical.
-    # ────────────────────────────────────────────
-    hierarchy_rounds: int = 20
-    bottom_diffusion_steps: int = 1   # all-pairs: 1 hop fully mixes the active vote (no loop)
-    top_diffusion_steps: int = 1     # all-pairs top: same
-    pc_eta_top: float = 0.5          # gain on the error that reaches the top
-    pc_eta_bottom: float = 0.1       # gain on the prediction that nudges the bottom
-
-    # ── Top-layer input: vote distribution vs average z ──
-    # If True, the top (abstract) layer sees the bottom columns' VOTE
-    # DISTRIBUTION (mean of softmax(decoder(z_i)) over active columns, 10-dim)
-    # instead of the average z-vector (32-dim). The vote distribution lets the
-    # top layer SEE disagreement among the bottom columns (e.g. 4 say 7, 4 say
-    # 1) rather than a mushy average. Fully differentiable (softmax+mean).
-    # Set False to restore the legacy average-z input for A/B comparison.
-    use_vote_input: bool = True
-    vote_temperature: float = 1.0    # softmax temperature for the vote (1.0 = normal)
+    # ── equilibrium propagation ──
+    beta: float = 0.1             # nudge strength
 
 
 @dataclass(frozen=True)
@@ -114,21 +52,15 @@ class TrainConfig:
     batch_size: int = 128
     lr: float = 1e-3
     weight_decay: float = 0.0
-    grad_clip: float | None = 1.0
-    log_every: int = 10
     save_dir: str = "results/runs"
     snapshot_every: int = 5
-    device: str = "cuda"
-    viz_after_train: bool = True
-    # robustness + spotlight checks run at every snapshot_every interval
     robustness_n_samples: int = 1000
-    viz_n_samples: int = 10
-    viz_sample_idx: int = 0
+    use_md_optimizer: bool = True   # MD-decoupled weights (stability)
 
 
 @dataclass(frozen=True)
 class ExperimentConfig:
-    name: str = "acn_default"
+    name: str = "acn"
     data: DataConfig = field(default_factory=DataConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
     train: TrainConfig = field(default_factory=TrainConfig)
@@ -155,63 +87,34 @@ class ExperimentConfig:
 
 _PRESETS: dict[str, ExperimentConfig] = {
     "poc": ExperimentConfig(
-        name="poc_result",
+        name="acn_poc",
         data=DataConfig(
-            dataset="digits", image_size=8, patch_size=4, stride=2, val_frac=0.2,
+            image_size=8, patch_size=4, stride=2, val_frac=0.2,
             train_subset=12000,
         ),
         model=ModelConfig(
             latent_dim=8, num_classes=10,
-            enc_hidden=(16,), dec_hidden=(16,),
-            rounds=3, diffusion_steps=1,
-            rho=1.0, eta_z=0.1,
-            D_init=1.0,
-            detach_after=None,
-            local_loss_weight=0.0,
-            column_sparsity_weight=0.001,
-            topology_mode="allpairs",
-            use_motor=True, motor_dim=2,
-            use_abstract_layer=True,
-            abstract_num_columns=8, abstract_dim=8, abstract_rounds=2,
-            topk_k=3,
-            hierarchy_rounds=3, bottom_diffusion_steps=1, top_diffusion_steps=1,
-            pc_eta_top=0.5, pc_eta_bottom=0.1,
+            enc_hidden=(16,), lateral_hidden=(16,),
+            topk_k=1000,
+            kappa=0.1, k_max=20, alpha=0.5, beta=0.1,
         ),
-        train=TrainConfig(
-            seed=0, epochs=50, batch_size=128, lr=1e-3, device="cuda", snapshot_every=5,
-            viz_after_train=False,
-        ),
+        train=TrainConfig(seed=0, epochs=30, batch_size=128, lr=3e-3,
+                          snapshot_every=5),
     ),
     "mnist": ExperimentConfig(
-        name="acn_result",
+        name="acn",
         data=DataConfig(
-            dataset="mnist", image_size=28, patch_size=7, stride=3, val_frac=0.1,
-            decomposition_mode="multi",
-            multi_scale_specs=((4, 4), (6, 6), (8, 8)),
-            pool_to=4,
+            image_size=28, patch_size=5, stride=2, val_frac=0.1,
         ),
         model=ModelConfig(
-            latent_dim=32, num_classes=10,
-            enc_hidden=(64, 64), dec_hidden=(64, 64),
-            rounds=20, diffusion_steps=1,
-            rho=1.0, eta_z=0.1,
-            D_init=1.0,
-            detach_after=8,
-            local_loss_weight=0.5,
-            column_sparsity_weight=0.001,
-            column_z_loss_weight=0.001,
-            topology_mode="allpairs",
-            use_motor=True, motor_dim=2,
-            use_abstract_layer=True,
-            abstract_num_columns=8, abstract_dim=16, abstract_rounds=5,
-            topk_k=8, topk_tau=0.5,
-            hierarchy_rounds=20, bottom_diffusion_steps=1, top_diffusion_steps=1,
-            pc_eta_top=0.5, pc_eta_bottom=0.1,
+            latent_dim=128, num_classes=10,
+            enc_hidden=(256, 256), lateral_hidden=(256,),
+            topk_k=1000,
+            kappa=0.1, k_max=20, alpha=0.5, beta=2.0,
+            lam_output=4.0,
         ),
-        train=TrainConfig(
-            seed=0, epochs=50, batch_size=128, lr=1e-3, device="cuda",
-            snapshot_every=5, viz_after_train=True,
-        ),
+        train=TrainConfig(seed=0, epochs=50, batch_size=128, lr=0.005,
+                          snapshot_every=5, use_md_optimizer=False),
     ),
 }
 
@@ -229,12 +132,15 @@ def _apply_overrides(cfg: ExperimentConfig, changes: dict[str, Any]) -> Experime
             section, leaf = key.split(".", 1)
             grouped.setdefault(section, {})[leaf] = val
         else:
-            grouped[key] = val  # type: ignore[assignment]
+            grouped[key] = val
     kwargs: dict[str, Any] = {}
     for section, vals in grouped.items():
         sub = getattr(cfg, section)
         if hasattr(sub, "__dataclass_fields__"):
-            kwargs[section] = replace(sub, **vals)
+            if hasattr(vals, "__dataclass_fields__"):
+                kwargs[section] = vals
+            else:
+                kwargs[section] = replace(sub, **vals)
         else:
             kwargs[section] = vals
     return replace(cfg, **kwargs)

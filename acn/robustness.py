@@ -4,18 +4,52 @@ Builds a fixed set of corrupted versions of a test batch (clean + 7
 corruptions: rot15, rot30, rot45, shift20, shift30, occ3×7, noise30) and
 measures the model's accuracy on each version. Used during training at every
 snapshot interval so we can track robustness as the model learns.
-
-The corruption transforms live in :mod:`acn.visualize` (shared with the
-robustness spotlight GIF); this module just wraps them with reproducible
-seeding and an evaluation loop.
 """
 from __future__ import annotations
 
 from collections import OrderedDict
 
+import numpy as np
 import torch
+import torch.nn.functional as F
 
-from acn.visualize import rotate_batch, shift_batch, occlude_batch, noise_batch
+
+# ── corruption transforms ──────────────────────────────────────────────
+
+def rotate_batch(X, degrees):
+    n = len(X)
+    ang = torch.empty(n, device=X.device).uniform_(-degrees, degrees)
+    theta = torch.zeros(n, 2, 3, device=X.device)
+    rad = ang * (np.pi / 180.0)
+    theta[:, 0, 0] = torch.cos(rad); theta[:, 0, 1] = -torch.sin(rad)
+    theta[:, 1, 0] = torch.sin(rad);  theta[:, 1, 1] = torch.cos(rad)
+    grid = F.affine_grid(theta, X.shape, align_corners=False)
+    return F.grid_sample(X, grid, align_corners=False, padding_mode="zeros")
+
+
+def occlude_batch(X, n_boxes=3, box_size=7):
+    out = X.clone()
+    H, W = X.shape[-2], X.shape[-1]
+    for _ in range(n_boxes):
+        r = torch.randint(0, H - box_size + 1, (len(X),), device=X.device)
+        c = torch.randint(0, W - box_size + 1, (len(X),), device=X.device)
+        for b in range(len(X)):
+            out[b, :, r[b]:r[b]+box_size, c[b]:c[b]+box_size] = 0.0
+    return out
+
+
+def noise_batch(X, sigma=0.3):
+    return (X + sigma * torch.randn_like(X)).clamp(0, 1)
+
+
+def shift_batch(X, frac=0.2):
+    n = len(X)
+    theta = torch.zeros(n, 2, 3, device=X.device)
+    theta[:, 0, 0] = 1.0; theta[:, 1, 1] = 1.0
+    theta[:, 0, 2] = torch.empty(n, device=X.device).uniform_(-frac, frac)
+    theta[:, 1, 2] = torch.empty(n, device=X.device).uniform_(-frac, frac)
+    grid = F.affine_grid(theta, X.shape, align_corners=False)
+    return F.grid_sample(X, grid, align_corners=False, padding_mode="zeros")
 
 # canonical version order (clean first) — shared with the spotlight GIF
 ROBUSTNESS_VERSIONS = [
