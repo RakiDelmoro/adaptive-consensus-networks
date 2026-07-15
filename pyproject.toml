@@ -3,24 +3,23 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "adaptive-consensus-networks"
-version = "0.0.1"
-description = "Adaptive Consensus Networks: mini networks with dynamic conductance consensus"
+name = "adaptive-consensus"
+version = "0.1.0"
+description = "Pruning Adaptive Sheaf-ADMM: dynamic edge/channel gating + adaptive halting for multi-agent coordination (PyTorch, MNIST)"
 requires-python = ">=3.10"
 dependencies = [
     "torch>=2.0",
     "torchvision>=0.15",
     "numpy>=1.23",
     "matplotlib>=3.6",
-    "pyyaml>=6.0",
     "tqdm>=4.64",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=7", "hypothesis>=6"]
+dev = ["pytest>=7"]
 
 [tool.setuptools]
-packages = ["acn"]
+packages = ["adaptive_consensus"]
 
 [tool.ruff]
 line-length = 100

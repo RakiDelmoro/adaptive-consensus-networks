@@ -1,24 +1,11 @@
-# results
-results/runs/
-results/figures/
-*.npz
-*.pt
-!tests/data/*.npz
-
-# downloaded data (MNIST)
-data/
-
-# python
 __pycache__/
-*.egg-info/
+*.pyc
 .pytest_cache/
+.ruff_cache/
 .hypothesis/
-build/
-dist/
-
-# notebooks
-.ipynb_checkpoints/
-
-# env
-.venv/
-.env
+results/
+*.pt
+*.gif
+*.png
+!data/
+data/
